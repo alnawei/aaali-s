@@ -175,7 +175,12 @@ def init_region_for_account(account_id, alias, ak, sk, region_id):
             user_data_b64 = base64.b64encode(boot_script.encode('utf-8')).decode('utf-8')
 
             print("   ⏳ [启动模板] 正在拼装完美图纸并创建...")
-            system_disk_config = ecs_models.CreateLaunchTemplateRequestSystemDisk(category='cloud_essd', size=20, delete_with_instance=True)
+            system_disk_config = ecs_models.CreateLaunchTemplateRequestSystemDisk(
+                category='cloud_essd', 
+                size=20, 
+                delete_with_instance=True, 
+                performance_level='PL0'
+            )
             
             create_lt_req = ecs_models.CreateLaunchTemplateRequest(
                 region_id=region_id,
