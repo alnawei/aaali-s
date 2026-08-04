@@ -327,10 +327,19 @@ except:
                 if line.startswith("NODE:"):
                     try:
                         p, lim, used_b, exp, st = line.replace("NODE:", "").split("|")
-                        used_gb = float(used_b) / (1024**3)
+                        used_b_float = float(used_b)
+                        
+                        # 🌟 修复：动态判断大盘列表展示单位
+                        if used_b_float < 1024**2:
+                            traffic_display = f"{used_b_float/1024:.1f}K"
+                        elif used_b_float < 1024**3:
+                            traffic_display = f"{used_b_float/(1024**2):.1f}M"
+                        else:
+                            traffic_display = f"{used_b_float/(1024**3):.1f}G"
+                            
                         lim_gb = float(lim)
                         status_icon = "🟢" if st == "running" else "🔴"
-                        btn_text = f"{status_icon} 端口 {p} | 流量:{used_gb:.1f}G/{lim_gb:.0f}G | 到期:{exp[:10]}"
+                        btn_text = f"{status_icon} 端口 {p} | 流量:{traffic_display}/{lim_gb:.0f}G | 到期:{exp[:10]}"
                         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"mg_cmd:port_ctrl-{p}:{inst_id}")])
                     except: pass
             
@@ -377,9 +386,20 @@ try:
     c.execute('SELECT limit_gb, used_bytes, expiry_date, status FROM mg_nodes WHERE port={port}')
     row = c.fetchone()
     if row:
-        used_gb = (row[1] if row[1] else 0) / (1024**3)
+        used_b = float(row[1] if row[1] else 0)
+        
+        # 🌟 修复：动态流量单位计算并自带单位输出
+        if used_b < 1024**2:
+            used_str = f'{{used_b/1024:.2f}} KB'
+        elif used_b < 1024**3:
+            used_str = f'{{used_b/(1024**2):.2f}} MB'
+        else:
+            used_str = f'{{used_b/(1024**3):.2f}} GB'
+            
         limit_str = '不限' if row[0] == 0 else f'{{row[0]:.0f}} GB'
-        print(f'INFO:{{limit_str}}|{{used_gb:.2f}} GB|{{row[2]}}|{{row[3]}}')
+        
+        # 注意这里把原有的 {used_gb:.2f} GB 换成了自带单位的 {used_str}
+        print(f'INFO:{{limit_str}}|{{used_str}}|{{row[2]}}|{{row[3]}')
     conn.close()
 except: pass
 "
@@ -393,6 +413,7 @@ except: pass
             
             # 3. 格式化排版详情面板
             if info_str:
+                # 这里的 used_gb 实际上解包出来就是类似 "187.75 KB" 的字符串了！
                 limit_gb, used_gb, exp_date, status = info_str.split("|")
                 status_cn = "🟢 正常运行" if status == "running" else f"🔴 {status}"
                 detail_text = (
