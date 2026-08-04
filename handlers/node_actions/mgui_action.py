@@ -270,7 +270,12 @@ except:
 
 conn = sqlite3.connect('/root/mg_core.db')
 c = conn.cursor()
-exp_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+import calendar
+now = datetime.datetime.now()
+m = now.month + 1; y = now.year
+if m > 12: m = 1; y += 1
+d = min(now.day, calendar.monthrange(y, m)[1])
+exp_date = now.replace(year=y, month=m, day=d).strftime('%Y-%m-%d %H:%M:%S')
 # 修复：插入时指定 used_bytes = 0
 c.execute('INSERT INTO mg_nodes (port, secret, limit_gb, used_bytes, status, reset_cycle, expiry_date) VALUES (?, ?, ?, 0, ?, ?, ?)', (port, secret, limit_gb, 'running', 'monthly', exp_date))
 conn.commit(); conn.close()
@@ -388,7 +393,7 @@ try:
     if row:
         used_b = float(row[1] if row[1] else 0)
         
-        # 🌟 修复：动态流量单位计算并自带单位输出
+        # 动态流量单位计算并自带单位输出
         if used_b < 1024**2:
             used_str = f'{{used_b/1024:.2f}} KB'
         elif used_b < 1024**3:
@@ -398,8 +403,7 @@ try:
             
         limit_str = '不限' if row[0] == 0 else f'{{row[0]:.0f}} GB'
         
-        # 注意这里把原有的 {used_gb:.2f} GB 换成了自带单位的 {used_str}
-        print(f'INFO:{{limit_str}}|{{used_str}}|{{row[2]}}|{{row[3]}')
+        print(f'INFO:{{limit_str}}|{{used_str}}|{{row[2]}}|{{row[3]}}')
     conn.close()
 except: pass
 "
@@ -413,7 +417,7 @@ except: pass
             
             # 3. 格式化排版详情面板
             if info_str:
-                # 这里的 used_gb 实际上解包出来就是类似 "187.75 KB" 的字符串了！
+                # 这里的 used_gb 实际上解包出来就是自带单位的字符串 (如 "187.75 KB")
                 limit_gb, used_gb, exp_date, status = info_str.split("|")
                 status_cn = "🟢 正常运行" if status == "running" else f"🔴 {status}"
                 detail_text = (
@@ -815,7 +819,12 @@ port = {port}; limit_gb = {traffic_gb}; secret = '{pwd}'
 
 conn = sqlite3.connect('/root/mg_core.db')
 c = conn.cursor()
-exp_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+import calendar
+now = datetime.datetime.now()
+m = now.month + 1; y = now.year
+if m > 12: m = 1; y += 1
+d = min(now.day, calendar.monthrange(y, m)[1])
+exp_date = now.replace(year=y, month=m, day=d).strftime('%Y-%m-%d %H:%M:%S')
 
 # 如果该端口之前有旧数据，先强制清理，防止主键冲突
 c.execute('DELETE FROM mg_nodes WHERE port=?', (port,))
