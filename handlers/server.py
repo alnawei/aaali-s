@@ -9,6 +9,7 @@ import config
 import glob
 import db  # 导入本地账本
 
+import calendar
 
 from aiogram.types import Message, CallbackQuery
 from handlers.common import get_dynamic_ecs_client
@@ -951,7 +952,37 @@ async def process_manage_ecs(callback: types.CallbackQuery):
         reset_display = f"跟随开机日 (每月 {reset_day} 号重置)"
     else:
         reset_display = f"自定义 (每月 {reset_day} 号重置)"
-    
+        
+    # 🌟 4. 动态推算客户业务到期时间 (如果数据库为空，则自动推算)
+    expire_time_str = biz_data.get('expire_time')
+    if not expire_time_str or str(expire_time_str).strip() in ["", "None", "未知日期"]:
+        try:
+            # 截取开机时间的前10位 (YYYY-MM-DD)
+            start_date_str = str(ali_data['creation_time'])[:10]
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            now = datetime.now()
+            
+            target_month = now.month
+            target_year = now.year
+            # 以重置日（或开机日）作为自然月锚点
+            anchor_day = int(reset_day)
+            
+            # 如果今天的日期已经超过或等于锚点日，说明推算到下个月
+            if now.day >= anchor_day:
+                target_month += 1
+                if target_month > 12:
+                    target_month = 1
+                    target_year += 1
+                    
+            # 防溢出：处理月末没有30/31号的情况
+            last_day = calendar.monthrange(target_year, target_month)[1]
+            final_day = min(anchor_day, last_day)
+            
+            expire_time_str = datetime(target_year, target_month, final_day).strftime("%Y-%m-%d")
+        except Exception as e:
+            expire_time_str = "时间推算失败"
+
+    # 组装最终展示文案
     text = (
         "📊 **ECS 实例详情**\n\n"
         f"🌍 地域: `{ali_data['region']}`\n"
@@ -960,8 +991,8 @@ async def process_manage_ecs(callback: types.CallbackQuery):
         f"✅ 状态: {status_str}\n"
         f"📶 本期出网流量: `{current_used_traffic} GB` / `{biz_data['traffic_limit_gb']} GB` (阈值95%防刷断网)\n"
         f"📅 服务器开机时间: `{ali_data['creation_time']}`\n"
-        f"⏳ 流量重置周期: `{reset_display}`\n"  # 🌟 智能文案生效
-        f"👤 客户业务到期: `{biz_data['expire_time']}`\n"
+        f"⏳ 流量重置周期: `{reset_display}`\n"
+        f"👤 客户业务到期: `{expire_time_str}`\n"  # 🌟 这里替换成了动态计算出的变量
     )
 
     builder = InlineKeyboardBuilder()
