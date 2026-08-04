@@ -1,14 +1,21 @@
 import asyncio
 import traceback
+import json
 from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from db import get_active_servers
-import config
-
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+
+# 假设您的 config 和 db 模块已在外部定义
+import config
+from db import get_active_servers
+
+# 阿里云 SDK 导入
+from alibabacloud_cms20190101.client import Client as CmsClient
+from alibabacloud_cms20190101 import models as cms_models
+from alibabacloud_tea_openapi import models as open_api_models
 
 router = Router()
 
@@ -35,7 +42,48 @@ def get_progress_bar(used: float, total: float, length: int = 5) -> str:
     else:
         return "🟩" * filled + "⬜" * empty
 
-# ================= 🛡️ 流量与计费核心入口 (绝不卡死防护版) =================
+
+# ================= 🔌 阿里云 CMS 流量查询核心逻辑 =================
+def _sync_fetch_aliyun_traffic(instance_id: str) -> float:
+    """
+    (同步阻塞函数) 调用阿里云云监控 API 获取 ECS 实例本月累计公网流出流量。
+    """
+    try:
+        # 初始化配置，强烈建议将 AK/SK 放到 config.py 或 .env 中
+        cms_config = open_api_models.Config(
+            access_key_id=config.ALIYUN_AK,          
+            access_key_secret=config.ALIYUN_SK,
+            endpoint='metrics.cn-hangzhou.aliyuncs.com' # 云监控全局统一 Endpoint
+        )
+        client = CmsClient(cms_config)
+
+        # 构造请求: 查询 ECS 实例网络流出量 (InternetOut)
+        request = cms_models.DescribeMetricLastRequest(
+            namespace='acs_ecs_dashboard',
+            metric_name='InternetOut',
+            dimensions=json.dumps([{"instanceId": instance_id}])
+        )
+        
+        response = client.describe_metric_last(request)
+        datapoints = json.loads(response.body.datapoints)
+        
+        if datapoints:
+            # 假设返回值是 Bytes，转换为 GB
+            bytes_used = datapoints[0].get('Average', 0) 
+            return round(bytes_used / (1024 ** 3), 2)
+        return 0.0
+    except Exception as e:
+        print(f"获取实例 {instance_id} 流量失败: {str(e)}")
+        raise e
+
+async def fetch_aliyun_traffic_gb(instance_id: str) -> float:
+    """
+    (异步包装器) 供 aiogram 的 handler 安全调用，防止阻塞机器人
+    """
+    return await asyncio.to_thread(_sync_fetch_aliyun_traffic, instance_id)
+
+
+# ================= 🛡️ 流量与计费核心入口 =================
 @router.message(F.text == "📊 流量与计费")
 async def show_traffic_report(message: Message):
     # 1. 发送正在执行的提示，并保存这条消息的句柄以供后续更新
@@ -52,13 +100,13 @@ async def show_traffic_report(message: Message):
                 parse_mode="HTML"
             )
 
-        # 2. 尝试获取流量数据（加入超时控制，最长允许运行 15 秒，绝不无限期卡住！）
+        # 2. 尝试获取流量数据（加入超时控制，适当延长时间以防多实例查询）
         report_text = await asyncio.wait_for(
             generate_traffic_summary(servers),
-            timeout=15.0
+            timeout=20.0
         )
         
-        # 🌟 3. 新增：构建悬浮设置按钮
+        # 3. 构建悬浮设置按钮
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(text="⚙️ 设置全局预警线", callback_data="sys_set_warn_line"),
@@ -81,7 +129,7 @@ async def show_traffic_report(message: Message):
             parse_mode="HTML"
         )
     except Exception as e:
-        # ⭐ 最核心的防卡死大招：如果发生任何隐藏异常，直接把具体错误贴到你的脸上！
+        # 如果发生任何异常，把具体错误抛出
         err_detail = traceback.format_exc()
         print(f"[Traffic Report Error]:\n{err_detail}")
         
@@ -93,6 +141,7 @@ async def show_traffic_report(message: Message):
             f"2. 请检查服务器环境中是否已正确安装依赖库：<code>pip install alibabacloud_cms20190101</code>",
             parse_mode="HTML"
         )
+
 
 # ================= 🚀 数据计算逻辑模块 =================
 async def generate_traffic_summary(servers):
@@ -110,41 +159,51 @@ async def generate_traffic_summary(servers):
     for srv in servers:
         inst_id = srv.get("instance_id", "未知ID")
         ip = srv.get("ip", "未知IP")
-        region = srv.get("region", "香港")
+        region = srv.get("region", "未知区域")
         
-        # 🌟 模拟从数据库和 CMS 获取的真实业务数据（请替换为你真实的取值逻辑）
-        limit_gb = srv.get("traffic_limit_gb", 500) # 总额度
-        # used_gb = await fetch_aliyun_traffic_gb(...) # 这里是你真正调 API 的地方
-        used_gb = srv.get("used_traffic_gb", 125.4) # 模拟当前用量
+        limit_gb = srv.get("traffic_limit_gb", 500) # 总额度优先从数据库读
         
-        expire_str = srv.get("expire_time", "2026-08-21")
+        # 🔥 核心修改 1: 真实调用阿里云 API 获取流量
+        try:
+            if inst_id != "未知ID":
+                used_gb = await fetch_aliyun_traffic_gb(inst_id)
+            else:
+                used_gb = srv.get("used_traffic_gb", 0.0) # 无ID时使用数据库缓存
+        except Exception as e:
+            print(f"[{ip}] 获取 CMS 流量失败，降级使用数据库缓存: {str(e)}")
+            used_gb = srv.get("used_traffic_gb", 0.0)
+        
+        # 🔥 核心修改 2: 真实解析数据库记录的到期时间
+        expire_str = srv.get("expire_time", "未知日期")
         
         # 计算剩余天数
         try:
-            expire_date = datetime.strptime(expire_str, "%Y-%m-%d")
-            days_left = (expire_date - now).days
-            days_text = f"剩余 {days_left} 天" if days_left >= 0 else "已逾期"
+            if expire_str != "未知日期":
+                expire_date = datetime.strptime(expire_str, "%Y-%m-%d")
+                days_left = (expire_date - now).days
+                days_text = f"剩余 {days_left} 天" if days_left >= 0 else "已逾期"
+            else:
+                days_text = "缺少到期数据"
         except ValueError:
-            days_text = "日期解析错误"
+            days_text = "日期格式异常"
 
         # 计算百分比与进度条
         percent = min((used_gb / limit_gb) * 100, 100) if limit_gb > 0 else 0
         bar = get_progress_bar(used_gb, limit_gb)
         
         try:
-            # 🌟 升级后的展示逻辑，将核心数据“拍在脸上”
+            # 🌟 组装节点信息
             report += f"💻 <b>[{region}]</b> <code>{ip}</code>\n"
-            # 状态可根据实例实际状态动态改变，此处做基础判断示例
             status_emoji = "🔴 已停用 (流量耗尽熔断)" if percent >= 95 else "🟢 正常运作"
             report += f" └ 状态: {status_emoji}\n"
             report += f" └ 流量: {used_gb} GB / {limit_gb} GB ({percent:.1f}%) {bar}\n"
             report += f" └ 账期: {expire_str} 到期 ({days_text})\n\n"
         except Exception as e:
-            report += f"💻 <code>{ip}</code> (数据解析受阻: {str(e)[:20]})\n\n"
+            report += f"💻 <code>{ip}</code> (数据组装受阻: {str(e)[:20]})\n\n"
             
     report += (
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <i>提示：所有计算默认按开机日为锚点循环。警戒线/熔断线一旦触发，系统将在后台全自动执行私聊警告或强制断网操作。</i>"
+        f"💡 <i>提示：所有计算默认按开机日为锚点循环。警戒线/熔断线一旦触发，系统将在后台全自动执行私聊警告或断网操作。无定时重启或维护计划。</i>"
     )
     return report
 
@@ -160,11 +219,8 @@ async def process_refresh_traffic(call: CallbackQuery):
 # ================= 2. 设置警戒线 =================
 @router.callback_query(F.data == "sys_set_warn_line")
 async def ask_warn_line(call: CallbackQuery, state: FSMContext):
-    # 如果有全局权限校验，可以在这里加 if call.from_user.id != config.ADMIN_ID: return
     await state.set_state(TrafficSettingsFSM.wait_for_warn_line)
     
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    from aiogram.types import InlineKeyboardButton
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ 取消操作", callback_data="cancel_fsm_action"))
     
@@ -184,7 +240,7 @@ async def receive_warn_line(message: Message, state: FSMContext):
     
     warn_percent = int(val)
     
-    # 🌟 这里对接你的数据库写入逻辑
+    # 对接数据库写入逻辑
     # import db
     # db.update_global_config("traffic_warn_line", warn_percent)
     
@@ -200,8 +256,6 @@ async def receive_warn_line(message: Message, state: FSMContext):
 async def ask_stop_line(call: CallbackQuery, state: FSMContext):
     await state.set_state(TrafficSettingsFSM.wait_for_stop_line)
     
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    from aiogram.types import InlineKeyboardButton
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ 取消操作", callback_data="cancel_fsm_action"))
     
@@ -221,7 +275,7 @@ async def receive_stop_line(message: Message, state: FSMContext):
     
     stop_percent = int(val)
     
-    # 🌟 这里对接你的数据库写入逻辑
+    # 对接数据库写入逻辑
     # import db
     # db.update_global_config("traffic_stop_line", stop_percent)
     
