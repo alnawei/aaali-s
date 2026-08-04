@@ -448,14 +448,49 @@ except: pass
 
     if action.startswith("port_link-"):
         port = action.split("-")[1]
-        script = f"sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}'"
-        out = await execute_mg_hybrid(instance_id, call.from_user.id, script)
-        secret = out.strip()
         
-        if secret and "ERR" not in secret and "no such table" not in secret:
-            # 保持一致的增强版菜单
+        # 1. 扩充底层查询脚本，一次性拉取该节点的所有详细数据
+        script = f"""
+python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('/root/mg_core.db')
+    c = conn.cursor()
+    c.execute('SELECT limit_gb, used_bytes, expiry_date, status, reset_cycle, secret FROM mg_nodes WHERE port={port}')
+    row = c.fetchone()
+    if row:
+        used_b = float(row[1] if row[1] else 0)
+        
+        # 动态流量单位计算
+        if used_b < 1024**2:
+            used_str = f'{{used_b/1024:.2f}} KB'
+        elif used_b < 1024**3:
+            used_str = f'{{used_b/(1024**2):.2f}} MB'
+        else:
+            used_str = f'{{used_b/(1024**3):.2f}} GB'
+            
+        limit_str = '不限' if row[0] == 0 else f'{{row[0]:.1f}} GB'
+        
+        # 打印组合数据 (截取日期前10位显示 YYYY-MM-DD)
+        print(f'LINK_INFO:{{limit_str}}|{{used_str}}|{{row[2][:10]}}|{{row[3]}}|{{row[4]}}|{{row[5]}}')
+    conn.close()
+except: pass
+"
+"""
+        out = await execute_mg_hybrid(instance_id, call.from_user.id, script)
+        
+        link_info = ""
+        for line in out.split("\n"):
+            if line.startswith("LINK_INFO:"):
+                link_info = line.replace("LINK_INFO:", "")
+        
+        if link_info:
+            # 2. 解析数据
+            limit_gb, used_str, exp_date, status, reset_cycle, secret = link_info.split("|")
+            status_cn = "🟢 运行中" if status == "running" else f"🔴 {status}"
+            
+            # 3. 构建键盘：修复 BUG，在此处移除掉“获取专属分享链接”的重复按钮
             buttons = [
-                [InlineKeyboardButton(text="🔗 获取该节点专属分享链接", callback_data=f"mg_cmd:port_link-{port}:{instance_id}")],
                 [InlineKeyboardButton(text="🔄 更换随机密钥", callback_data=f"mg_cmd:port_rand_sec-{port}:{instance_id}"),
                  InlineKeyboardButton(text="✍️ 更换指定密钥", callback_data=f"mg_cmd:port_cust_sec-{port}:{instance_id}")],
                 [InlineKeyboardButton(text="📢 绑定 MTP 置顶广告 (Ad Tag)", callback_data=f"mg_cmd:port_ad_tag-{port}:{instance_id}")],
@@ -465,15 +500,22 @@ except: pass
                 [InlineKeyboardButton(text="🔙 返回节点列表", callback_data=f"mg_cmd:port_list:{instance_id}")]
             ]
             
+            # 4. 构建图5风格的精美详情排版
             text = (
-                f"🎛 <b>专属端口管控台：<code>{port}</code></b>\n\n"
-                f"🔗 <b>该节点的直连链接如下：</b>\n"
-                f"<code>tg://proxy?server={ip}&port={port}&secret={secret}</code>\n\n"
-                f"请选择你要对该节点执行的操作："
+                f"📄 <b>节点详情</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🖥 <b>IP:</b> <code>{ip}</code>\n"
+                f"🔌 <b>端口:</b> <code>{port}</code>\n"
+                f"🕒 <b>到期:</b> <code>{exp_date}</code>\n"
+                f"📊 <b>流量:</b> {used_str} / {limit_gb}\n"
+                f"♻️ <b>重置:</b> {reset_cycle}\n"
+                f"📈 <b>状态:</b> {status_cn}\n\n"
+                f"🔑 <b>密钥:</b>\n<code>{secret}</code>\n\n"
+                f"🔗 <b>链接:</b>\n<code>tg://proxy?server={ip}&port={port}&secret={secret}</code>"
             )
             await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         else:
-            await call.answer("解析失败，未找到该节点密钥", show_alert=True)
+            await call.answer("解析失败，未找到该节点详细信息", show_alert=True)
         return
 
     if action.startswith("port_renew-"):
