@@ -568,6 +568,8 @@ c.execute('UPDATE mg_nodes SET secret=? WHERE port=?', (secret, {port}))
 conn.commit(); conn.close()
 "
 bash /root/mg_executor.sh delete {port}
+# 🌟 新增：确保老密钥进程死透，再启动新密钥进程
+pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
 nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") >/dev/null 2>&1 &
 echo 'RAND_SEC_OK'
 """
@@ -634,7 +636,11 @@ echo 'RST_OK'
         port = action.split("-")[1]
         script = f"""
 bash /root/mg_executor.sh delete {port}
+# 🌟 新增：强制物理超度僵尸进程，无视 PID 文件错误
+pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
+# 🌟 新增：双向清理防火墙规则
 iptables -D OUTPUT -p tcp --sport {port} 2>/dev/null || true
+iptables -D INPUT -p tcp --dport {port} 2>/dev/null || true
 sqlite3 /root/mg_core.db "DELETE FROM mg_nodes WHERE port={port}"
 echo 'DEL_OK'
 """
@@ -922,10 +928,12 @@ async def mgui_set_custom_secret(message: Message, state: FSMContext):
     
     wait_msg = await message.answer(f"⏳ 正在为端口 <code>{port}</code> 写入自定义密钥并重启...", parse_mode="HTML")
     
-    # ✅ 修复：加入 nohup 持久化
+    # ✅ 修复：加入 pkill 和 nohup 持久化
     script = f"""
 sqlite3 /root/mg_core.db "UPDATE mg_nodes SET secret='{secret}' WHERE port={port}"
 bash /root/mg_executor.sh delete {port}
+# 🌟 新增：强制超度
+pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
 nohup bash /root/mg_executor.sh start {port} '{secret}' >/dev/null 2>&1 &
 echo 'SET_SEC_OK'
 """
@@ -961,6 +969,8 @@ c.execute('UPDATE mg_nodes SET ad_tag=? WHERE port=?', ('{ad_tag}', {port}))
 conn.commit(); conn.close()
 "
 bash /root/mg_executor.sh delete {port}
+# 🌟 新增：强制超度
+pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
 nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") '{ad_tag}' >/dev/null 2>&1 &
 echo 'SET_AD_OK'
 """
