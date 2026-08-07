@@ -551,7 +551,27 @@ conn.close()
     try: await call.answer("指令已开始在后台执行，请耐心等待...", show_alert=False)
     except Exception: pass
 
-    if action == "install": shell_script = """apt-get update -y && apt-get install -y curl wget sqlite3\nbash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'y\\nadmin\\nadmin\\n54321\\n' || true\n/usr/local/x-ui/x-ui setting -username admin -password admin -port 54321 || true\nsystemctl enable x-ui && systemctl restart x-ui\necho "INSTALL_XUI_SUCCESS" """
+    if action == "install": 
+        shell_script = """
+# 1. 强制补全本地网卡 (修复 Xray 死亡死循环占用 CPU)
+ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+ip link set lo up
+grep -q "iface lo inet loopback" /etc/network/interfaces || echo "auto lo\\niface lo inet loopback" >> /etc/network/interfaces
+
+# 2. 正常执行 3x-ui 面板安装
+apt-get update -y && apt-get install -y curl wget sqlite3
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'y\\nadmin\\nadmin\\n54321\\n' || true
+/usr/local/x-ui/x-ui setting -username admin -password admin -port 54321 || true
+
+# 3. 强制回退激进的 TCP 优化参数 (拯救 MTProto 断流问题)
+sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
+echo 'net.ipv4.tcp_tw_reuse = 0' >> /etc/sysctl.conf
+sysctl -p >/dev/null 2>&1
+
+# 4. 重启应用
+systemctl enable x-ui && systemctl restart x-ui
+echo "INSTALL_XUI_SUCCESS"
+"""
     elif action == "update": shell_script = "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'n\\n' && systemctl restart x-ui"
     elif action == "start": shell_script = "systemctl start x-ui && systemctl restart x-ui && echo 'SUCCESS'"
     elif action == "stop": shell_script = "systemctl stop x-ui && echo 'SUCCESS'"
@@ -677,3 +697,5 @@ print('ROUTE_OK')
         await wait_msg.edit_text("❌ <b>配置失败：</b>\n底层通信严重超时，未能确认路由注入结果。", reply_markup=port_kb, parse_mode="HTML")
     except Exception as e:
         await wait_msg.edit_text(f"❌ <b>路由注入失败：</b>\n{str(e)}", reply_markup=port_kb, parse_mode="HTML")
+
+
