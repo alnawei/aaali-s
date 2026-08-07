@@ -156,6 +156,7 @@ def build_mg_keyboard(instance_id: str, is_installed: bool = True) -> InlineKeyb
         [InlineKeyboardButton(text="⚡ 一键生成 MG 专属节点 (直连 / 500G)", callback_data=f"mg_cmd:add_mtp_quick:{instance_id}")],
         [InlineKeyboardButton(text="🛠️ 生成自定义节点 (自定义端口/密码/流量)", callback_data=f"mg_cmd:add_mtp_custom:{instance_id}")],
         [InlineKeyboardButton(text="📋 节点列表与端口管理 (改配置/重置流量)", callback_data=f"mg_cmd:port_list:{instance_id}")],
+        [InlineKeyboardButton(text="🔄 一键重启/修复所有 MTP 节点", callback_data=f"mg_cmd:fix_all_mtp:{instance_id}")],
         [toggle_btn, InlineKeyboardButton(text="🔑 恢复默认账密", callback_data=f"mg_cmd:reset_pass:{instance_id}")],
         [InlineKeyboardButton(text="🤖 设置全局预警 Bot", callback_data=f"mg_cmd:set_bot:{instance_id}"), InlineKeyboardButton(text="🤖 一键下发绑定", callback_data=f"mg_cmd:bind_bot:{instance_id}")],
         [InlineKeyboardButton(text="🗑️ 彻底卸载 MG-UI", callback_data=f"mg_cmd:uninstall:{instance_id}")],
@@ -262,7 +263,50 @@ async def execute_mg_command(call: CallbackQuery, state: FSMContext):
     except ValueError: return await call.answer("解析异常", show_alert=True)
     
     ip = await asyncio.to_thread(get_server_ip, instance_id)
+# ================= 🔄 批量一键重启并注入高并发 =================
+    if action == "fix_all_mtp":
+        wait_msg = await call.message.edit_text("⏳ 正在扫描底层数据库，准备批量清理僵尸进程并注入高并发权限...\n<i>(后台处理中，请稍候...)</i>", parse_mode="HTML")
+        try: await call.answer("一键修复中...", show_alert=False)
+        except: pass
 
+        shell_script = """
+cat << 'EOF' > /tmp/fix_mtp.py
+import sqlite3, os
+try:
+    conn = sqlite3.connect('/root/mg_core.db')
+    c = conn.cursor()
+    c.execute("SELECT port, secret FROM mg_nodes")
+    rows = c.fetchall()
+    count = 0
+    for r in rows:
+        port, secret = r[0], r[1]
+        os.system(f'pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true')
+        cmd = f'nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} \'{secret}\'" >/dev/null 2>&1 &'
+        os.system(cmd)
+        count += 1
+    print(f"FIX_OK|{count}")
+except Exception as e:
+    print(f"FIX_ERR|{str(e)}")
+EOF
+python3 /tmp/fix_mtp.py
+rm -f /tmp/fix_mtp.py
+"""
+        try:
+            out = await asyncio.wait_for(execute_mg_hybrid(instance_id, call.from_user.id, shell_script), timeout=180.0)
+            if "FIX_OK" in out:
+                count = [line.split("|")[1] for line in out.split('\n') if line.startswith("FIX_OK|")][0]
+                await wait_msg.edit_text(
+                    f"✅ <b>一键修复/重启完成！</b>\n\n"
+                    f"🖥 <b>实例</b>：<code>{instance_id}</code>\n"
+                    f"🛠 <b>处理结果</b>：已强制清理并使用超高并发权限重新拉起了 <b>{count}</b> 个 MTProto 节点。\n"
+                    f"💡 <i>此操作已生效，节点假死与断流问题已被强制修复。</i>",
+                    reply_markup=build_mg_keyboard(instance_id), parse_mode="HTML"
+                )
+            else:
+                await wait_msg.edit_text(f"⚠️ <b>修复异常：</b>\n回显：<code>{out[:100]}</code>", reply_markup=build_mg_keyboard(instance_id), parse_mode="HTML")
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ <b>修复失败：</b>\nSSH底层执行异常: <code>{str(e)}</code>", reply_markup=build_mg_keyboard(instance_id), parse_mode="HTML")
+        return
     # ================= ⚡ 一键极速生成 MTP 节点 =================
     if action == "add_mtp_quick":
         wait_msg = await call.message.edit_text("⏳ 正在分配随机端口并生成 MTP 节点，配置 500GB 限额...\n<i>(后台处理中，请稍候...)</i>", parse_mode="HTML")
@@ -296,7 +340,7 @@ conn.commit(); conn.close()
 print(f'MTP_RES:{{port}}|{{secret}}|{{exp_date}}')
 "
 iptables -C OUTPUT -p tcp --sport {port} 2>/dev/null || iptables -I OUTPUT -p tcp --sport {port}
-nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") >/dev/null 2>&1 &
+nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}')" >/dev/null 2>&1 &
 """
         try:
             out = await asyncio.wait_for(execute_mg_hybrid(instance_id, call.from_user.id, shell_script), timeout=180.0)
@@ -544,10 +588,10 @@ if row and row[0]:
     c.execute('UPDATE mg_nodes SET expiry_date=?, status=\\'running\\' WHERE port=?', (new_dt, {port}))
     conn.commit()
     print('RENEW_OK')
-conn.close()
-"
-nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") >/dev/null 2>&1 &
-"""
+    conn.close()
+    "
+    nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}')" >/dev/null 2>&1 &
+    """
         await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"✅ 端口 {port} 已成功续费 1 个自然月！", show_alert=True)
         return await render_mg_port_list(call.message, instance_id, call.from_user.id)
@@ -570,7 +614,7 @@ conn.commit(); conn.close()
 bash /root/mg_executor.sh delete {port}
 # 🌟 新增：确保老密钥进程死透，再启动新密钥进程
 pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
-nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") >/dev/null 2>&1 &
+nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}')" >/dev/null 2>&1 &
 echo 'RAND_SEC_OK'
 """
         await execute_mg_hybrid(instance_id, call.from_user.id, script)
@@ -829,7 +873,7 @@ conn.commit(); conn.close()
 print(f'MTP_RES:{{port}}|{{secret}}|{{exp_date}}')
 "
 iptables -C OUTPUT -p tcp --sport {port} 2>/dev/null || iptables -I OUTPUT -p tcp --sport {port}
-nohup bash /root/mg_executor.sh start {port} "{pwd}" >/dev/null 2>&1 &
+nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} '{pwd}'" >/dev/null 2>&1 &
 """
 
     try:
@@ -934,7 +978,7 @@ sqlite3 /root/mg_core.db "UPDATE mg_nodes SET secret='{secret}' WHERE port={port
 bash /root/mg_executor.sh delete {port}
 # 🌟 新增：强制超度
 pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
-nohup bash /root/mg_executor.sh start {port} '{secret}' >/dev/null 2>&1 &
+nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} '{secret}'" >/dev/null 2>&1 &
 echo 'SET_SEC_OK'
 """
     try:
@@ -971,7 +1015,7 @@ conn.commit(); conn.close()
 bash /root/mg_executor.sh delete {port}
 # 🌟 新增：强制超度
 pkill -9 -f "0.0.0.0:{port}" 2>/dev/null || true
-nohup bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}") '{ad_tag}' >/dev/null 2>&1 &
+nohup bash -c "ulimit -n 65535 2>/dev/null; bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}') '{ad_tag}'" >/dev/null 2>&1 &
 echo 'SET_AD_OK'
 """
     try:
