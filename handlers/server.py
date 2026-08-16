@@ -11,6 +11,7 @@ import db  # 导入本地账本
 
 import calendar
 
+from aiogram.filters import StateFilter  # 🌟 必须加上这行
 from aiogram.types import Message, CallbackQuery
 from handlers.common import get_dynamic_ecs_client
 
@@ -35,8 +36,8 @@ router = Router()
 
 # ================= 新增：🛡️ 全局最高权限拦截 =================
 # 只要发消息或点击按钮的人不是 ADMIN_ID，这个 router 里的所有函数都不会被触发，直接无视！
-router.message.filter(F.from_user.id == config.ADMIN_ID)
-router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
+router.message.filter(F.from_user.id == int(config.ADMIN_ID))
+router.callback_query.filter(F.from_user.id == int(config.ADMIN_ID))
 # =========================================================
 
 # ================= 全局地域大名单 =================
@@ -212,10 +213,50 @@ def _fetch_single_region_sync(account_id: int, region_id: str) -> list:
         print(f"❌ 获取实例列表失败 (Account ID: {account_id}, Region: {region_id}): {e}")
         return []
 
+def _fetch_swas_single_region_sync(account_id: int, region_id: str) -> list:
+    """内部同步函数：去单个地域拿轻量云(SWAS)数据"""
+    try:
+        from alibabacloud_swas_open20200601.client import Client as SwasClient
+        from alibabacloud_tea_openapi import models as open_api_models
+        from alibabacloud_swas_open20200601 import models as swas_models
+        import sqlite3
+        import config
+
+        conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
+        cursor = conn.cursor()
+        cursor.execute("SELECT access_key, access_secret FROM cloud_accounts WHERE id = ?", (account_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row: return []
+        ak, sk = row
+        
+        ali_config = open_api_models.Config(
+            access_key_id=ak.strip(),
+            access_key_secret=sk.strip(),
+            endpoint=f'swas.{region_id}.aliyuncs.com'
+        )
+        client = SwasClient(ali_config)
+        req = swas_models.ListInstancesRequest(region_id=region_id)
+        resp = client.list_instances(req)
+        
+        instances = []
+        if resp.body.instances:
+            for inst in resp.body.instances:
+                ip = inst.public_ip_address if inst.public_ip_address else "无公网IP"
+                instances.append({
+                    "id": inst.instance_id,
+                    "ip": ip,
+                    "status": inst.status,
+                    "region": region_id,
+                    "is_swas": True  # 🌟 重点：给轻量云打上专属烙印
+                })
+        return instances
+    except Exception as e:
+        return []
+
 async def get_instances_by_account_async(account_id: int) -> list:
-    """⚡️ 极限优化版：先查本地雷达精准定位，再向阿里云发起狙击请求"""
-    
-    # 1. ⚡️ 毫秒级查库：利用刚才修好的 ecs_business 表，提取该账号真正有机器的地域
+    """⚡️ 极限优化版：同时并发向 ECS 和 轻量云 发起狙击请求"""
     try:
         conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
         cursor = conn.cursor()
@@ -223,19 +264,18 @@ async def get_instances_by_account_async(account_id: int) -> list:
         active_regions = [row[0] for row in cursor.fetchall()]
         conn.close()
     except Exception as e:
-        print(f"查库失败: {e}")
-        active_regions = ["cn-hongkong"] # 发生意外时的基础兜底
+        active_regions = []
         
-    # 🌟 极致秒开：如果账本显示该账号名下根本没有机器，直接 0 延迟返回空列表！
-    if not active_regions:
-        return []
+    # 为了防止轻量云没写入 DB 导致查不到，强制加上几个核心节点作为底座
+    default_regions = {"cn-hongkong", "ap-southeast-1", "us-east-1", "ap-northeast-1"}
+    active_regions = list(set(active_regions) | default_regions)
         
-    # 2. 🎯 精准请求：只向真实存在机器的 1~2 个地域发起 API 并发请求
-    # 将原来 16 个请求锐减到 1~2 个，把耗时从 2 秒瞬间压榨到 0.2 秒左右！
-    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in active_regions]
-    results = await asyncio.gather(*tasks)
+    # 🎯 并发请求：一半查 ECS，一半查 SWAS
+    ecs_tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in active_regions]
+    swas_tasks = [asyncio.to_thread(_fetch_swas_single_region_sync, account_id, r) for r in active_regions]
     
-    # 摊平列表并返回
+    results = await asyncio.gather(*(ecs_tasks + swas_tasks))
+    
     return [inst for region_list in results for inst in region_list]
 
 # ================= 2. 动态折叠菜单 UI 构建器 =================
@@ -256,7 +296,7 @@ def get_region_main_menu():
     builder.row(InlineKeyboardButton(text="🐪 中东及其他", callback_data="menu_others"))
     
     # 返回主菜单
-    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_main")) 
+    builder.row(InlineKeyboardButton(text="🔙 取消并返回", callback_data="cancel_add_server"))
     
     return builder.as_markup()
 
@@ -389,7 +429,8 @@ async def process_account_selection(call: types.CallbackQuery, state: FSMContext
         builder = InlineKeyboardBuilder()
         
         # ⚠️ 注意：这里彻底删掉了“强制同步最新数据”按钮，因为现在每一次点击，本身就是最暴力的强制同步！
-        builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
+        builder.row(InlineKeyboardButton(text="☁️ 创建 阿里云 ECS 实例", callback_data="add_server"))
+        builder.row(InlineKeyboardButton(text="🪶 创建 阿里云轻量云 (SWAS)", callback_data="add_swas_server"))
         
         region_map = {
             "cn-hongkong": "HK", "ap-northeast-1": "JP", "ap-northeast-2": "KR",    
@@ -408,10 +449,19 @@ async def process_account_selection(call: types.CallbackQuery, state: FSMContext
                 status_emoji = "🔵"
                 
             short_region = region_map.get(inst['region'], inst['region'])
-            btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
-            btn_data = f"manage_ecs_{inst['id']}" 
+            
+            # 🌟 核心判断：如果是轻量云，不仅要改前缀标签，还要改变它点击后的专属路由！
+            if inst.get("is_swas"):
+                btn_text = f"{status_emoji} [轻量—{short_region}] IP: {inst['ip']}"
+                btn_data = f"manage_swas_{inst['id']}"  # 👈 注意这里改成了 manage_swas_
+            else:
+                btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
+                btn_data = f"manage_ecs_{inst['id']}"   # 👈 保持原有的 ECS 通道
+                
+            # 下面这行不用动
             builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
             
+        # 👇 这个返回按钮原封不动保留
         builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="back_to_accounts"))
         
         await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
@@ -470,10 +520,19 @@ async def process_force_sync(call: types.CallbackQuery, state: FSMContext):
                 status_emoji = "🔵"
                 
             short_region = region_map.get(inst['region'], inst['region'])
-            btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
-            btn_data = f"manage_ecs_{inst['id']}" 
+            
+            # 🌟 核心判断：如果是轻量云，不仅要改前缀标签，还要改变它点击后的专属路由！
+            if inst.get("is_swas"):
+                btn_text = f"{status_emoji} [轻量—{short_region}] IP: {inst['ip']}"
+                btn_data = f"manage_swas_{inst['id']}"  # 👈 注意这里改成了 manage_swas_
+            else:
+                btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
+                btn_data = f"manage_ecs_{inst['id']}"   # 👈 保持原有的 ECS 通道
+                
+            # 下面这行不用动
             builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
             
+        # 👇 这个返回按钮原封不动保留
         builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="back_to_accounts"))
         
         # 用最新拿到的数据，替换掉旧面板
@@ -485,13 +544,12 @@ async def process_force_sync(call: types.CallbackQuery, state: FSMContext):
 
 # 1. 🔙 返回上级 (从二级机器列表回到一级账号列表)
 # ================= ↩️ 返回账号列表 =================
-@router.callback_query(F.data == "back_to_accounts")
+@router.callback_query(F.data == "back_to_accounts", StateFilter("*"))
 async def process_back_to_accounts(call: types.CallbackQuery, state: FSMContext):
+    # 强制清空残余状态
     await state.clear()
     
-    # 完全一样的异步查库逻辑
     def _fetch_accounts():
-
         try:
             conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
             cursor = conn.cursor()
@@ -502,11 +560,9 @@ async def process_back_to_accounts(call: types.CallbackQuery, state: FSMContext)
         except Exception:
             return []
             
-
     accounts = await asyncio.to_thread(_fetch_accounts)
     
     builder = InlineKeyboardBuilder()
-    
     if not accounts:
         builder.row(InlineKeyboardButton(text="⚠️ 暂无可用云账号，请先添加", callback_data="no_action"))
     else:
@@ -520,11 +576,16 @@ async def process_back_to_accounts(call: types.CallbackQuery, state: FSMContext)
     await call.answer()
 
 # 2. ❌ 关闭菜单
-@router.callback_query(F.data == "close_menu")
-async def process_close_menu(call: types.CallbackQuery):
-    # 直接删除这条菜单消息，保持对话框整洁
+@router.callback_query(F.data == "close_menu", StateFilter("*"))
+async def process_close_menu(call: types.CallbackQuery, state: FSMContext):
+    await state.clear() # 关闭菜单的同时清空所有缓存状态，防止幽灵 BUG
     await call.message.delete()
     await call.answer()
+
+# 无效按钮的弹窗拦截
+@router.callback_query(F.data == "no_action", StateFilter("*"))
+async def process_no_action(callback: types.CallbackQuery):
+    await callback.answer("请点击下方【➕ 添加云账号】按钮开始操作", show_alert=True)
 
 # 3. ➕ 添加云账号入口
 @router.callback_query(F.data == "add_cloud_account")
@@ -643,6 +704,26 @@ async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.answer()
 
+
+# ================= ↩️ 取消新增服务器并退回 =================
+@router.callback_query(F.data == "cancel_add_server", StateFilter("*"))
+async def process_cancel_add_server(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("🔄 正在返回...")
+    
+    user_data = await state.get_data()
+    account_id = user_data.get("current_account_id")
+    
+    await state.clear()
+    
+    if account_id:
+        await state.update_data(current_account_id=account_id)
+        # 🌟 重点在这里：克隆一个带新 data 的对象，而不是直接修改 callback.data
+        fake_callback = callback.model_copy(update={"data": f"select_acc:{account_id}"})
+        await process_account_selection(fake_callback, state)
+    else:
+        # 退回主菜单不需要传参数，直接原样传 callback 即可
+        await process_back_to_accounts(callback, state)
+  
 # @router.message(ServerManagement.waiting_for_code)
 # async def verify_add_server_code(message: types.Message, state: FSMContext):
 #     """处理用户输入的验证码，并展示云端启动模板"""
@@ -1013,7 +1094,7 @@ async def process_manage_ecs(callback: types.CallbackQuery):
         InlineKeyboardButton(text="⏳ 修改重置日", callback_data=f"set_resetday_{instance_id}"),
         InlineKeyboardButton(text="🗑️ 释放服务器", callback_data=f"release_ecs_{instance_id}")
     )
-    builder.row(InlineKeyboardButton(text="🔙 返回服务器列表", callback_data="back_to_list"))
+    builder.row(InlineKeyboardButton(text="🔙 返回服务器列表", callback_data=f"select_acc:{ali_data['account_id']}"))
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
