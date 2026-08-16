@@ -6,6 +6,7 @@ alibabacloud-tea-openapi>=0.3.8
 alibabacloud_ecs20140526>=3.0.0
 alibabacloud_cms20190101>=2.0.0
 alibabacloud_vpc20160428
+alibabacloud_swas-open20200601
 
 # ==================== SSH 远程连接与自动化部署 ====================
 paramiko>=3.0.0
