@@ -28,7 +28,7 @@ async def traffic_monitor_job(bot: Bot, admin_id: int):
     cursor = conn.cursor()
     
     # 获取所有登记在册的机器
-    cursor.execute("SELECT instance_id, traffic_limit_gb, traffic_start_time FROM ecs_business")
+    cursor.execute("SELECT instance_id, traffic_limit_gb, traffic_start_time FROM ecs_business WHERE instance_id NOT LIKE 'ssh_%'")
     rows = cursor.fetchall()
     
     # 🌟 【核心修复】：获取所有已激活的云账号，彻底抛弃旧版的 config 静态秘钥
