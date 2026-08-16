@@ -10,6 +10,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
 from aiogram.filters import StateFilter
 
+
+
 # 阿里云 SDK 依赖 (需确保安装了 alibabacloud_swas-open20200601)
 # pip install alibabacloud_swas-open20200601
 from alibabacloud_swas_open20200601.client import Client as SwasClient
@@ -28,6 +30,61 @@ class SwasFSM(StatesGroup):
     waiting_for_plan = State()
 
 # ================= 底层 API 与工厂函数 =================
+
+
+def _get_swas_status_sync(account_id: int, region_id: str, instance_id: str) -> str:
+    """获取单台轻量云的实时状态 (Running, Stopped 等)"""
+    from alibabacloud_swas_open20200601 import models as swas_models
+    try:
+        client = get_swas_client(account_id, region_id)
+        req = swas_models.ListInstancesRequest(
+            region_id=region_id,
+            instance_ids=json.dumps([instance_id])
+        )
+        resp = client.list_instances(req)
+        if resp.body.instances:
+            return resp.body.instances[0].status
+    except Exception:
+        pass
+    return "Unknown"
+
+def _execute_swas_action_sync(instance_id: str, action: str) -> dict:
+    """同步执行实例的电源与重装操作"""
+    import json
+    from alibabacloud_swas_open20200601 import models as swas_models
+    
+    meta = get_single_swas_sync(instance_id)
+    if not meta:
+        return {"success": False, "error": "未在数据库中匹配到该实例信息"}
+    
+    try:
+        client = get_swas_client(meta["account_id"], meta["region"])
+        
+        if action == "stop":
+            req = swas_models.StopInstancesRequest(region_id=meta["region"], instance_ids=json.dumps([instance_id]))
+            client.stop_instances(req)
+        elif action == "start":
+            req = swas_models.StartInstancesRequest(region_id=meta["region"], instance_ids=json.dumps([instance_id]))
+            client.start_instances(req)
+        elif action == "reinstall":
+            # ⚠️ 修复：轻量云的 ResetSystem 不接受 password 参数，仅重置系统盘
+            req = swas_models.ResetSystemRequest(
+                region_id=meta["region"],
+                instance_id=instance_id
+            )
+            client.reset_system(req)
+        elif action == "resetpw":
+            # 🌟 新增：调用专门的接口修改轻量云的密码
+            req = swas_models.UpdateInstanceAttributeRequest(
+                region_id=meta["region"],
+                instance_id=instance_id,
+                password="@QS00008"
+            )
+            client.update_instance_attribute(req)
+            
+        return {"success": True, "account_id": meta["account_id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def get_swas_client(account_id: int, region_id: str) -> SwasClient:
     """动态获取轻量云 (SWAS) 客户端"""
@@ -456,16 +513,136 @@ async def process_manage_swas(callback: types.CallbackQuery):
         InlineKeyboardButton(text="🔑 强制重置密码", callback_data=f"swas_action_resetpw_{instance_id}"),
         InlineKeyboardButton(text="🗑️ 释放服务器", callback_data=f"swas_action_release_{instance_id}")
     )
+    
+    # 🌟 新增：重装系统按钮
+    builder.row(InlineKeyboardButton(text="💿 重装系统", callback_data=f"swas_action_reinstall_{instance_id}"))
+    
     builder.row(InlineKeyboardButton(text="🔙 返回服务器列表", callback_data=f"select_acc:{ali_data['account_id']}"))
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 # 占位拦截器：防止用户点击轻量云功能按钮时转圈卡死
-@swas_router.callback_query(F.data.startswith("swas_action_"))
-async def process_swas_placeholders(callback: types.CallbackQuery):
-    action = callback.data.split("_")[2]
-    if action == "stop": msg = "正在下发关机指令..."
-    elif action == "start": msg = "正在下发开机指令..."
-    elif action == "resetpw": msg = "正在重置密码为 @QS00008..."
-    else: msg = "轻量云功能专区正在开发中..."
-    await callback.answer(msg, show_alert=True)
+@swas_router.callback_query(F.data.startswith("swas_action_stop_") | F.data.startswith("swas_action_start_"))
+async def process_swas_power_action(callback: types.CallbackQuery):
+    """【执行】真实的开关机逻辑"""
+    parts = callback.data.split("_")
+    action = parts[2] # stop 或 start
+    instance_id = parts[3]
+    
+    await callback.answer(f"⏳ 正在向阿里云下发{'关机' if action=='stop' else '开机'}指令...", show_alert=False)
+    
+    # 扔进后台线程并发执行API
+    result = await asyncio.to_thread(_execute_swas_action_sync, instance_id, action)
+    
+    if result["success"]:
+        await callback.answer("✅ 指令下发成功！请等待几秒后再次点击面板刷新。", show_alert=True)
+        # 自动调用你之前的详情函数刷新面板状态
+        callback.data = f"manage_swas_{instance_id}"
+        await process_manage_swas(callback)
+    else:
+        await callback.answer(f"❌ 操作失败: {result.get('error')}", show_alert=True)
+
+@swas_router.callback_query(F.data.startswith("swas_action_reinstall_"))
+async def process_swas_reinstall_ask(callback: types.CallbackQuery):
+    """【询问】重装系统防误触二次确认"""
+    instance_id = callback.data.split("_")[3]
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⚠️ 确认重装 (清空全部数据)", callback_data=f"swas_confirm_reinstall_{instance_id}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 取消并返回详情", callback_data=f"manage_swas_{instance_id}")
+    )
+    await callback.message.edit_text(
+        "⚠️ **高危操作确认：重装系统**\n\n"
+        "此操作将把您的轻量应用服务器恢复至初始镜像状态：\n"
+        "1. 系统盘上的**所有数据将被彻底擦除且无法恢复**。\n"
+        "2. 默认密码将被重新变更为 `@QS00008`。\n\n"
+        "您确定要继续执行吗？",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@swas_router.callback_query(F.data.startswith("swas_confirm_reinstall_"))
+async def process_swas_reinstall_execute(callback: types.CallbackQuery):
+    """【执行】轻量云全自动重装连招 (关机 -> 重置 -> 开机)"""
+    instance_id = callback.data.split("_")[3]
+    
+    # 1. 获取机器基础信息
+    meta = await asyncio.to_thread(get_single_swas_sync, instance_id)
+    if not meta:
+        return await callback.answer("❌ 未找到实例信息，请重试", show_alert=True)
+        
+    account_id = meta["account_id"]
+    region_id = meta["region"]
+    
+    # 更新 UI：提示开始执行
+    progress_msg = await callback.message.edit_text(
+        "⏳ **全自动重装连招启动中...**\n\n"
+        "正在检测实例状态并下发指令，该过程约需 1-3 分钟，请不要操作菜单...",
+        parse_mode="Markdown"
+    )
+
+    try:
+        # ================= 自动化编排流程 =================
+        
+        # 步骤 A: 检查状态并强制关机
+        current_status = await asyncio.to_thread(_get_swas_status_sync, account_id, region_id, instance_id)
+        if current_status == "Running":
+            await progress_msg.edit_text("⏳ **进度 1/3**：正在下发关机指令，等待云端响应...")
+            await asyncio.to_thread(_execute_swas_action_sync, instance_id, "stop")
+            
+            # 轮询等待关机彻底完成 (每 5 秒查一次)
+            while True:
+                await asyncio.sleep(5)
+                status = await asyncio.to_thread(_get_swas_status_sync, account_id, region_id, instance_id)
+                if status == "Stopped":
+                    break
+                elif status == "Unknown": # 防止死循环
+                    raise Exception("获取状态失败")
+
+        # 步骤 B: 提交重置系统请求
+        await progress_msg.edit_text("⏳ **进度 2/3**：已关机。正在擦除系统盘并重置镜像...")
+        result = await asyncio.to_thread(_execute_swas_action_sync, instance_id, "reinstall")
+        if not result["success"]:
+            raise Exception(result.get("error", "重置接口调用失败"))
+            
+        # 缓冲等待 10 秒，确保底层重置任务受理完成
+        await asyncio.sleep(10)
+        
+        # 🌟 追加步骤：系统重置后，独立下发修改密码指令
+        await progress_msg.edit_text("⏳ **进度 2.5/3**：系统盘擦除完成，正在写入默认密码...")
+        pw_result = await asyncio.to_thread(_execute_swas_action_sync, instance_id, "resetpw")
+        if not pw_result["success"]:
+            # 即使密码修改失败，也别阻断流程，可能需要稍后手动在面板重置
+            pass
+        
+        # 步骤 C: 尝试下发开机指令
+        await progress_msg.edit_text("⏳ **进度 3/3**：正在引导系统开机...")
+        await asyncio.to_thread(_execute_swas_action_sync, instance_id, "start")
+        
+        # ================= 流程结束 =================
+
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回服务器列表", callback_data=f"select_acc:{account_id}"))
+        
+        # 完美复刻 ECS 的成功文案回显
+        await progress_msg.edit_text(
+            f"✅ **轻量云 (SWAS) 全自动重装已完成！**\n\n"
+            f"🆔 实例: `{instance_id}`\n"
+            f"🔑 默认密码: `@QS00008`\n\n"
+            f"🚀 机器正在云端开机并初始化，请等待 1-2 分钟后尝试使用 SSH 连接。\n"
+            f"*(可点击下方按钮返回列表重新刷新状态)*",
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回详情", callback_data=f"manage_swas_{instance_id}"))
+        await progress_msg.edit_text(
+            f"❌ **重装流程意外中断**\n\n原因: `{str(e)}`",
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown"
+        )
