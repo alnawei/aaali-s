@@ -110,14 +110,15 @@ def sync_all_accounts():
                         UPDATE ecs_business SET ip = ?, name = ? WHERE instance_id = ?
                     """, (public_ip, instance_name, instance_id))
                 
-                # 🌟 清理本地的“幽灵机器”：查找该账号在当前地域的本地记录
-                cursor.execute("SELECT instance_id FROM ecs_business WHERE account_id = ? AND region_id = ?", (acc_id, region))
+                # 🌟 清理本地的“幽灵机器”：查找该账号在当前地域的本地记录 (增加过滤，放过 ssh_ 开头的自定义机器)
+                cursor.execute("SELECT instance_id FROM ecs_business WHERE account_id = ? AND region_id = ? AND instance_id NOT LIKE 'ssh_%'", (acc_id, region))
                 local_instances = [row[0] for row in cursor.fetchall()]
                 
                 # 如果本地有，但云端没有了，执行删除
                 for local_id in local_instances:
                     if local_id not in cloud_instance_ids:
-                        cursor.execute("DELETE FROM ecs_business WHERE instance_id = ?", (local_id,))
+                        # 🌟 双重保险：删除操作处再次拦截 ssh_ 机器，防止被误杀
+                        cursor.execute("DELETE FROM ecs_business WHERE instance_id = ? AND instance_id NOT LIKE 'ssh_%'", (local_id,))
                         print(f"   🧹 清理已释放的幽灵机器: {local_id}")
 
                 # 将真实的数量覆盖写入 account_assets 表
