@@ -4,7 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import tasks
 import config
 from handlers import common, server, traffic, node, system
-
+from handlers import swas_action  # 👈 新增这一行：引入轻量云模块
 from handlers.node_actions.bbr_action import router as bbr_router
 from handlers.node_actions.xui_action import router as xui_router
 from handlers.node_actions.mgui_action import router as mgui_router
@@ -36,6 +36,7 @@ async def main():
     dp.include_router(server.router)
     dp.include_router(traffic.router)
     dp.include_router(system.router)
+    dp.include_router(swas_action.swas_router)  # 确保有这一行，把它挂载进去
 
     # 🛠️ 修正 2：修复 NameError，从模块中正确获取 router 对象
     dp.include_router(node.router)
