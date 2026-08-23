@@ -2,6 +2,7 @@ import sqlite3
 import config
 from aiogram import Router, F, types
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 from db import get_active_servers  
 import asyncio
 import paramiko
@@ -10,14 +11,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================= 1. 定义添加服务器的 FSM 状态机 =================
-class MguiAddServerFSM(StatesGroup):
+class AddServerFSM(StatesGroup):
     wait_for_ip = State()
     wait_for_pwd = State()
 
 router = Router()
 
-# ================= 🌍 地域名称映射字典 =================
 REGION_MAP = {
     "cn-hongkong": "香港",
     "ap-northeast-1": "东京",
@@ -26,12 +25,17 @@ REGION_MAP = {
     "cn-shanghai": "上海",
 }
 
-# ================= 🛠️ 工具函数与智能数据自愈 =================
+SWAS_REGIONS = [
+    "cn-hongkong", "ap-southeast-1", "ap-northeast-1", "ap-northeast-2",
+    "us-east-1", "us-west-1", "eu-central-1", "eu-west-1",
+    "cn-hangzhou", "cn-beijing", "cn-shanghai", "cn-shenzhen",
+    "cn-chengdu", "cn-qingdao", "cn-guangzhou", "cn-heyuan",
+    "cn-huhehaote", "cn-wulanchabu"
+]
+
+SWAS_LOADING_ACCOUNTS = set()
+
 def get_servers_data(user_id: int):
-    """
-    ⚡️ 针对 ecs_business 表量身定制：
-    如果有 0.0.0.0 脏数据，自动开启全库搜索和实时抓取并持久化修复！
-    """
     try:
         from db import get_active_servers
         servers = get_active_servers(user_id)
@@ -40,7 +44,6 @@ def get_servers_data(user_id: int):
 
     if not servers:
         try:
-            # 已统一修复为 config.DB_PATH
             conn = sqlite3.connect(config.DB_PATH, timeout=3.0)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
@@ -75,11 +78,7 @@ def get_servers_data(user_id: int):
     return servers if servers else []
 
 def build_servers_keyboard(user_id: int):
-    """
-    ⚡️ 智能状态灯版键盘菜单：完美分离 ECS、轻量云(SWAS) 和 自定义SSH。
-    """
     servers = get_servers_data(user_id)
-    
     builder = InlineKeyboardBuilder()
     
     REGION_SHORT = {
@@ -96,7 +95,6 @@ def build_servers_keyboard(user_id: int):
     
     for srv in servers:
         inst_id = str(srv.get("instance_id", ""))
-        region_raw = srv.get("region_id", srv.get("region", ""))
         ip_val = srv.get("ip", "")
         
         if ip_val in ["0.0.0.0", "", "None"] and not inst_id.startswith("ssh_") and not inst_id.startswith("i-"):
@@ -113,7 +111,7 @@ def build_servers_keyboard(user_id: int):
                 grouped_accounts[acc_id] = {'name': acc_name, 'nodes': []}
             grouped_accounts[acc_id]['nodes'].append(srv)
             
-    # ================= 1. 动态渲染 ECS 机器（按账号） =================
+    # 1. ECS 机器
     for acc_id, acc_info in grouped_accounts.items():
         builder.row(InlineKeyboardButton(text=f"━━━ 🏢 阿里云：{acc_info['name']} ━━━", callback_data="ignore_click"))
         row_buttons = []
@@ -139,9 +137,8 @@ def build_servers_keyboard(user_id: int):
         if row_buttons:
             builder.row(*row_buttons)
 
-    # ================= 2. 动态渲染轻量云 (SWAS) 专属入口 =================
+    # 2. 轻量云 (SWAS) 入口
     try:
-        import sqlite3, config
         conn = sqlite3.connect(config.DB_PATH, timeout=3.0)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM cloud_accounts WHERE is_active = 1")
@@ -161,7 +158,7 @@ def build_servers_keyboard(user_id: int):
     except Exception as e:
         print(f"⚠️ 渲染轻量云按钮失败: {e}")
 
-    # ================= 3. 渲染手动添加的 SSH 机器 =================
+    # 3. 自定义 SSH 机器
     if ssh_nodes:
         builder.row(InlineKeyboardButton(text="━━━ 🔌 自定义 SSH 服务器 ━━━", callback_data="ignore_click"))
         row_buttons = []
@@ -179,11 +176,9 @@ def build_servers_keyboard(user_id: int):
     builder.row(InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add"))
     return builder.as_markup()
 
-# ================= 🚀 第一步：接收主菜单点击 =================
 @router.message(F.text == "⚙️ 节点配置")
 async def show_node_list(message: types.Message):
     servers = get_servers_data(message.from_user.id)
-    
     if not servers:
         return await message.answer(
             "📭 **当前名下暂无可用机器！**\n\n"
@@ -201,9 +196,9 @@ async def show_node_list(message: types.Message):
         parse_mode="Markdown"
     )
 
-# ================= 🛠️ 辅助函数：【终极优化】一次握手，三合一极速探活 =================
+# 仅保留 bbr 与 x-ui 的状态探测
 def check_all_scripts_status(instance_id: str, ip: str) -> dict:
-    res = {"bbr": False, "xui": False, "mgui": False}
+    res = {"bbr": False, "xui": False}
     if not ip or ip in ["0.0.0.0", "阿里云分配IP中...", "未知IP"]:
         return res
         
@@ -243,7 +238,6 @@ def check_all_scripts_status(instance_id: str, ip: str) -> dict:
         combined_cmd = """
         if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi bbr; then echo 'RES_bbr:1'; else echo 'RES_bbr:0'; fi
         if systemctl is-active --quiet x-ui || test -f /usr/local/x-ui/x-ui; then echo 'RES_xui:1'; else echo 'RES_xui:0'; fi
-        if systemctl is-active --quiet mg-panel || systemctl is-active --quiet mgui || ps aux | grep -v grep | grep -qi mgui; then echo 'RES_mgui:1'; else echo 'RES_mgui:0'; fi
         """
         stdin, stdout, stderr = client.exec_command(combined_cmd, timeout=5.0)
         output = stdout.read().decode('utf-8')
@@ -251,7 +245,6 @@ def check_all_scripts_status(instance_id: str, ip: str) -> dict:
         for line in output.splitlines():
             if "RES_bbr:1" in line: res["bbr"] = True
             if "RES_xui:1" in line: res["xui"] = True
-            if "RES_mgui:1" in line: res["mgui"] = True
             
     except Exception:
         pass
@@ -261,7 +254,6 @@ def check_all_scripts_status(instance_id: str, ip: str) -> dict:
             
     return res
 
-# ================= 🚀 第二步：选中服务器，展示动态状态与脚本清单 =================
 @router.callback_query(F.data.startswith("srv_sel:"))
 async def show_script_options(call: types.CallbackQuery):
     try:
@@ -274,7 +266,6 @@ async def show_script_options(call: types.CallbackQuery):
     
     if not srv:
         try:
-            # 已统一修复为 config.DB_PATH
             conn = sqlite3.connect(config.DB_PATH, timeout=3.0)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
@@ -296,10 +287,10 @@ async def show_script_options(call: types.CallbackQuery):
     if public_ip == "0.0.0.0" or not public_ip:
         public_ip = "⏳ 阿里云分配IP中..."
     
+    # 彻底移除 MG 面板
     raw_scripts = [
         {"id": "bbr", "label": "bbr 加速"},
-        {"id": "xui", "label": "x-ui 面板"},
-        {"id": "mgui", "label": "MG 私有面板"},
+        {"id": "xui", "label": "3x-ui 面板 (全能代理)"},
     ]
     
     status_dict = await asyncio.to_thread(check_all_scripts_status, instance_id, public_ip)
@@ -309,7 +300,7 @@ async def show_script_options(call: types.CallbackQuery):
         is_running = status_dict.get(script["id"], False)
         status_icon = "🟢" if is_running else "🔴"
         button_text = f"{status_icon} {script['label']}"
-        cb_data = f"run_sh:{script['id']}:{instance_id}"
+        cb_data = f"run_sh:{script['id']}:{instance_id}:{public_ip}"
         builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
     
     if not instance_id.startswith("i-"):
@@ -329,11 +320,9 @@ async def show_script_options(call: types.CallbackQuery):
     )
     await call.answer()
 
-# ================= ↩️ 附加步：返回按钮逻辑 =================
 @router.callback_query(F.data == "back_to_srv_list")
 async def back_to_servers(call: types.CallbackQuery):
     servers = get_servers_data(call.from_user.id)
-    
     if not servers:
         return await call.message.edit_text(
             "📭 **当前名下暂无可用机器！**\n\n"
@@ -352,11 +341,9 @@ async def back_to_servers(call: types.CallbackQuery):
     )
     await call.answer()
 
-# ================= ❌ 删除自定义服务器逻辑 =================
 @router.callback_query(F.data.startswith("del_custom_srv:"))
 async def process_del_custom_server(call: types.CallbackQuery):
     instance_id = call.data.split(":")[-1]
-    
     try:
         import db
         db.delete_custom_server(instance_id)
@@ -364,7 +351,6 @@ async def process_del_custom_server(call: types.CallbackQuery):
         return await call.answer(f"删除失败: {e}", show_alert=True)
     
     await call.answer("❌ 自定义服务器已彻底从控制台移除！", show_alert=True)
-    
     await call.message.edit_text(
         f"✅ **操作成功**\n\n"
         f"实例 `{instance_id}` 的本地信息及业务计费数据已抹除。\n\n"
@@ -375,10 +361,7 @@ async def process_del_custom_server(call: types.CallbackQuery):
         parse_mode="Markdown"
     )
 
-# =====================================================================
-# ================= ➕ 添加自定义服务器逻辑 (FSM) =====================
-# =====================================================================
-
+# ================= ➕ 添加自定义服务器逻辑 (FSM) =================
 async def test_ssh_connection(ip: str, password: str, port: int = 22) -> bool:
     try:
         client = paramiko.SSHClient()
@@ -393,23 +376,21 @@ async def test_ssh_connection(ip: str, password: str, port: int = 22) -> bool:
 async def add_custom_server_start(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != config.ADMIN_ID:
         return await call.answer("权限不足！", show_alert=True)
-        
-    await state.set_state(MguiAddServerFSM.wait_for_ip)
+    await state.set_state(AddServerFSM.wait_for_ip)
     await call.message.answer("➕ **添加自定义服务器 (SSH)**\n\n🌐 请输入服务器的公网 IP 地址：\n*(回复 0 取消操作)*", parse_mode="Markdown")
     await call.answer()
 
-@router.message(MguiAddServerFSM.wait_for_ip)
+@router.message(AddServerFSM.wait_for_ip)
 async def add_custom_server_ip(message: types.Message, state: FSMContext):
     ip = message.text.strip()
     if ip == '0':
         await state.clear()
         return await message.answer("已取消操作。")
-        
     await state.update_data(ip=ip)
-    await state.set_state(MguiAddServerFSM.wait_for_pwd)
+    await state.set_state(AddServerFSM.wait_for_pwd)
     await message.answer(f"✅ IP `{ip}` 已记录。\n\n🔑 请输入该服务器的 Root 密码：\n*(回复 0 取消操作)*", parse_mode="Markdown")
 
-@router.message(MguiAddServerFSM.wait_for_pwd)
+@router.message(AddServerFSM.wait_for_pwd)
 async def add_custom_server_pwd(message: types.Message, state: FSMContext):
     pwd = message.text.strip()
     if pwd == '0':
@@ -428,7 +409,6 @@ async def add_custom_server_pwd(message: types.Message, state: FSMContext):
             import db
             db.add_custom_server(instance_id, ip, pwd)
             await state.clear()
-            
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 刷新节点配置列表", callback_data="back_to_srv_list")]
             ])
@@ -460,8 +440,7 @@ async def retry_custom_server_pwd(call: types.CallbackQuery, state: FSMContext):
     ip = data.get('ip')
     if not ip:
         return await call.message.edit_text("❌ 会话已过期，请重新发起添加操作。")
-        
-    await state.set_state(MguiAddServerFSM.wait_for_pwd)
+    await state.set_state(AddServerFSM.wait_for_pwd)
     await call.message.edit_text(
         f"👉 请重新输入服务器 `{ip}` 的 SSH 密码 (root):\n*(回复 0 取消操作)*", 
         parse_mode="Markdown"
@@ -477,62 +456,70 @@ async def cancel_custom_server_add(call: types.CallbackQuery, state: FSMContext)
     await call.message.edit_text("🗑️ 操作已取消，无效的服务器信息已被丢弃。", reply_markup=keyboard)
     await call.answer()
 
+# ================= 🪶 轻量云并发查询与展开 =================
+def _fetch_single_swas_region(ak: str, sk: str, region_id: str):
+    from alibabacloud_swas_open20200601.client import Client as SwasClient
+    from alibabacloud_tea_openapi import models as open_api_models
+    from alibabacloud_swas_open20200601 import models as swas_models
 
-# =====================================================================
-# ================= 🪶 展开指定账号的轻量云 (SWAS) =====================
-# =====================================================================
+    try:
+        ali_config = open_api_models.Config(
+            access_key_id=ak.strip(), access_key_secret=sk.strip(),
+            endpoint=f'swas.{region_id}.aliyuncs.com'
+        )
+        client = SwasClient(ali_config)
+        req = swas_models.ListInstancesRequest(region_id=region_id, page_size=100)
+        resp = client.list_instances(req)
+        if resp.body and resp.body.instances:
+            return [
+                {
+                    "id": inst.instance_id,
+                    "ip": inst.public_ip_address if inst.public_ip_address else "0.0.0.0",
+                    "status": inst.status,
+                    "region": region_id
+                }
+                for inst in resp.body.instances
+            ]
+    except Exception:
+        pass
+    return []
+
+async def fetch_all_swas_concurrently(ak: str, sk: str):
+    sem = asyncio.Semaphore(6)
+    async def _worker(region_id: str):
+        async with sem:
+            return await asyncio.to_thread(_fetch_single_swas_region, ak, sk, region_id)
+
+    tasks = [_worker(r) for r in SWAS_REGIONS]
+    results = await asyncio.gather(*tasks)
+    return [inst for sublist in results for inst in sublist]
+
 @router.callback_query(F.data.startswith("node_expand_swas:"))
 async def expand_swas_nodes(call: types.CallbackQuery):
     try:
         acc_id = int(call.data.split(":")[1])
-        await call.answer("🔄 正在从云端实时拉取轻量云节点...", show_alert=False)
-        
-        def _fetch_swas():
-            import sqlite3, config
-            from alibabacloud_swas_open20200601.client import Client as SwasClient
-            from alibabacloud_tea_openapi import models as open_api_models
-            from alibabacloud_swas_open20200601 import models as swas_models
+    except ValueError:
+        return await call.answer("数据解析异常！", show_alert=True)
 
-            conn = sqlite3.connect(config.DB_PATH, timeout=3.0)
-            cursor = conn.cursor()
-            cursor.execute("SELECT access_key, access_secret FROM cloud_accounts WHERE id = ?", (acc_id,))
-            row = cursor.fetchone()
-            conn.close()
-            
-            if not row: return []
-            ak, sk = row
+    if acc_id in SWAS_LOADING_ACCOUNTS:
+        return await call.answer("⚠️ 正在检索云端实例中，请稍候...", show_alert=False)
 
-            regions = ["cn-hongkong", "ap-southeast-1", "ap-northeast-1", "ap-northeast-2",
-                       "us-east-1", "us-west-1", "eu-central-1", "eu-west-1",
-                       "cn-hangzhou", "cn-beijing", "cn-shanghai", "cn-shenzhen",
-                       "cn-chengdu", "cn-qingdao", "cn-guangzhou", "cn-heyuan",
-                       "cn-huhehaote", "cn-wulanchabu"]
+    SWAS_LOADING_ACCOUNTS.add(acc_id)
+    await call.answer("🔄 正在并发检索 18 个地域轻量云...", show_alert=False)
+
+    try:
+        conn = sqlite3.connect(config.DB_PATH, timeout=3.0)
+        cursor = conn.cursor()
+        cursor.execute("SELECT access_key, access_secret FROM cloud_accounts WHERE id = ?", (acc_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return await call.message.answer("❌ 找不到对应的云账号凭据！")
             
-            swas_list = []
-            for region_id in regions:
-                try:
-                    ali_config = open_api_models.Config(
-                        access_key_id=ak.strip(), access_key_secret=sk.strip(),
-                        endpoint=f'swas.{region_id}.aliyuncs.com'
-                    )
-                    client = SwasClient(ali_config)
-                    req = swas_models.ListInstancesRequest(region_id=region_id)
-                    resp = client.list_instances(req)
-                    if resp.body.instances:
-                        for inst in resp.body.instances:
-                            ip = inst.public_ip_address if inst.public_ip_address else "0.0.0.0"
-                            swas_list.append({
-                                "id": inst.instance_id,
-                                "ip": ip,
-                                "status": inst.status,
-                                "region": region_id
-                            })
-                except Exception:
-                    continue
-            return swas_list
-            
-        swas_instances = await asyncio.to_thread(_fetch_swas)
-        
+        ak, sk = row
+        swas_instances = await fetch_all_swas_concurrently(ak, sk)
+
         builder = InlineKeyboardBuilder()
         acc_name = f"主账号 (ID:{acc_id})" if acc_id == 1 else f"账号 {acc_id}"
 
@@ -541,53 +528,54 @@ async def expand_swas_nodes(call: types.CallbackQuery):
         else:
             for inst in swas_instances:
                 status_emoji = "🟢" if inst['status'] == 'Running' else "🔴"
-                
-                # 🌟 核心修复：把 acc_id 传递给下一层，确保能正确返回
                 builder.row(InlineKeyboardButton(
                     text=f"{status_emoji} SWAS | {inst['ip']}", 
                     callback_data=f"swas_setup:{acc_id}:{inst['id']}:{inst['ip']}" 
                 ))
                 
         builder.row(InlineKeyboardButton(text="🔙 返回节点配置", callback_data="back_to_srv_list")) 
-        
-        text = f"🪶 **轻量云 (SWAS) 节点列表**\n\n所属账号: `{acc_name}`\n请选择你要配置的服务器："
-        await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        text = f"🪶 **轻量云 (SWAS) 节点列表**\n\n所属账号: `{acc_name}` (共找到 {len(swas_instances)} 台)\n请选择你要配置的服务器："
+
+        try:
+            await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                await call.answer("✅ 列表已经是最新状态")
+            else:
+                raise e
 
     except Exception as e:
-        await call.message.answer(f"❌ 展开轻量云失败，捕获到底层错误：\n`{str(e)}`", parse_mode="Markdown")
+        await call.message.answer(f"❌ 展开轻量云失败：`{str(e)}`", parse_mode="Markdown")
+    finally:
+        SWAS_LOADING_ACCOUNTS.discard(acc_id)
 
-# =====================================================================
-# ================= 🪶 轻量云专属的装机脚本面板 =======================
-# =====================================================================
+# ================= 🪶 轻量云装机脚本面板 =================
 @router.callback_query(F.data.startswith("swas_setup:"))
 async def show_swas_script_options(call: types.CallbackQuery):
-    """专属通道：无需查库，直接利用上一步传过来的 IP 进行 SSH 探活！"""
     try:
-        # 🌟 修改：正确接收上一层传过来的 acc_id
         _, acc_id, instance_id, public_ip = call.data.split(":")
     except ValueError:
         return await call.answer("数据解析异常！", show_alert=True)
         
     await call.answer("正在探测服务器状态...", show_alert=False)
 
+    # 彻底移除 MG 面板
     raw_scripts = [
         {"id": "bbr", "label": "bbr 加速"},
-        {"id": "xui", "label": "x-ui 面板"},
-        {"id": "mgui", "label": "MG 私有面板"},
+        {"id": "xui", "label": "3x-ui 面板 (全能代理)"},
     ]
     
     status_dict = await asyncio.to_thread(check_all_scripts_status, instance_id, public_ip)
     
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     builder = []
     for script in raw_scripts:
         is_running = status_dict.get(script["id"], False)
         status_icon = "🟢" if is_running else "🔴"
         button_text = f"{status_icon} {script['label']}"
-        cb_data = f"run_sh:{script['id']}:{instance_id}"
+        # 传递 IP 确保后续面板无需查库直接连接
+        cb_data = f"run_sh:{script['id']}:{instance_id}:{public_ip}"
         builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
 
-    # 🌟 修改：返回按钮指向具体的账号轻量云列表 (第二层)
     builder.append([InlineKeyboardButton(text="🔙 返回节点列表", callback_data=f"node_expand_swas:{acc_id}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=builder)
     
