@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-3x-ui Telegram 面板管控模块 (精简紧凑路由版，解决 Telegram 64 字节 callback_data 限制)
+3x-ui Telegram 面板管控模块 (修复 0.0.0.0 脏数据与 IP 自愈版)
 """
 
 from __future__ import annotations
@@ -80,10 +80,23 @@ CREATE TABLE IF NOT EXISTS xui_panels (
 )
 """
 
+def is_valid_ip(ip: Optional[str]) -> bool:
+    if not ip: return False
+    ip_str = str(ip).strip()
+    if ip_str in ["0.0.0.0", "", "None", "127.0.0.1"] or "0.0.0" in ip_str or "分配" in ip_str:
+        return False
+    try:
+        socket.inet_aton(ip_str)
+        return True
+    except OSError:
+        return False
+
 def _ensure_panel_table() -> None:
     conn = db.get_connection()
     try:
         conn.execute(PANEL_TABLE_SQL)
+        # 🌟 自动清洗历史残留的 0.0.0.0 脏数据
+        conn.execute("DELETE FROM xui_panels WHERE ip = '0.0.0.0' OR ip LIKE '%0.0.0%' OR ip IS NULL")
         conn.commit()
     finally:
         conn.close()
@@ -98,8 +111,7 @@ def get_panel_record(instance_id: str) -> Optional[dict[str, Any]]:
             (instance_id,),
         )
         row = cur.fetchone()
-        if not row:
-            return None
+        if not row: return None
         keys = [
             "instance_id", "ip", "username", "password", "port",
             "base_path", "scheme", "installed", "version", "xray_version"
@@ -117,6 +129,8 @@ def save_panel_record(
     base_path: str = XUI_BASE_PATH,
     scheme: str = "http",
 ) -> None:
+    if not is_valid_ip(ip): return  # 🌟 彻底拒绝写入 0.0.0.0
+
     _ensure_panel_table()
     conn = db.get_connection()
     try:
@@ -164,38 +178,54 @@ class SSHTarget:
 def resolve_ssh_target(instance_id: str, ip_hint: Optional[str] = None) -> SSHTarget:
     default_pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
     
-    if ip_hint and "0.0.0" not in ip_hint:
+    # 1. 优先使用有效的外部传入 IP (必须通过合法性校验)
+    if is_valid_ip(ip_hint):
         save_panel_record(instance_id, ip_hint)
         return SSHTarget(instance_id, ip_hint, "root", default_pwd, 22)
 
+    # 2. 查 xui_panels 持久化记录
+    rec = get_panel_record(instance_id)
+    if rec and is_valid_ip(rec.get("ip")):
+        return SSHTarget(instance_id, rec["ip"], "root", default_pwd, 22)
+
+    # 3. 查 custom_servers
     conn = db.get_connection()
     try:
         cur = conn.execute("SELECT ip, root_password FROM custom_servers WHERE instance_id = ?", (instance_id,))
         row = cur.fetchone()
-        if row and row[0]:
+        if row and is_valid_ip(row[0]):
             pwd = str(row[1]) if row[1] else default_pwd
             return SSHTarget(instance_id, str(row[0]), "root", pwd, 22)
 
+        # 4. 查 ecs_business
         cur = conn.execute("SELECT ip FROM ecs_business WHERE instance_id = ?", (instance_id,))
         row = cur.fetchone()
-        if row and row[0]:
+        if row and is_valid_ip(row[0]):
             return SSHTarget(instance_id, str(row[0]), "root", default_pwd, 22)
     finally:
         conn.close()
 
-    rec = get_panel_record(instance_id)
-    if rec and rec.get("ip"):
-        return SSHTarget(instance_id, rec["ip"], "root", default_pwd, 22)
+    # 5. 如果查不到或为 0.0.0.0，尝试通过阿里云 API 动态自愈
+    try:
+        from utils.aliyun import get_instance_ip
+        real_ip = get_instance_ip(instance_id)
+        if is_valid_ip(real_ip):
+            save_panel_record(instance_id, real_ip)
+            return SSHTarget(instance_id, real_ip, "root", default_pwd, 22)
+    except Exception:
+        pass
 
+    # 6. SSH 命名实例
     if instance_id.startswith("ssh_"):
         ip = instance_id[4:].replace("_", ".")
-        return SSHTarget(instance_id, ip, "root", default_pwd, 22)
+        if is_valid_ip(ip):
+            return SSHTarget(instance_id, ip, "root", default_pwd, 22)
 
-    raise ValueError(f"无法定位实例 `{instance_id}` 的公网 IP，请返回列表重新进入！")
+    raise ValueError(f"实例 `{instance_id}` 未分配公网 IP，请先返回【⚙️ 节点配置】重新进入！")
 
 def _ssh_exec_sync(target: SSHTarget, command: str, timeout: int = 300) -> tuple[int, str, str]:
     if paramiko is None:
-        raise RuntimeError("缺少 paramiko，请执行：pip install paramiko")
+        raise RuntimeError("缺少 paramiko 库，请执行：pip install paramiko")
 
     passwords_to_try = [target.password]
     if target.password != "@QS00008":
@@ -230,7 +260,7 @@ def _ssh_exec_sync(target: SSHTarget, command: str, timeout: int = 300) -> tuple
             break
 
     if not client:
-        raise RuntimeError(f"SSH 连接 {target.host}:22 鉴权失败：{last_exc}")
+        raise RuntimeError(f"SSH 远程鉴权失败 ({target.host}:22)：{last_exc}")
 
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -318,7 +348,7 @@ class XUIClient:
 
 async def detect_xui_client(instance_id: str, ip_hint: Optional[str] = None) -> XUIClient:
     rec = get_panel_record(instance_id)
-    if rec:
+    if rec and is_valid_ip(rec.get("ip")):
         candidate = XUIClient(rec["ip"], rec["username"], rec["password"], rec["port"], rec["base_path"])
     else:
         target = resolve_ssh_target(instance_id, ip_hint)
@@ -366,7 +396,6 @@ def inline_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
         ]
     )
 
-# 🌟 精简后的按钮（全面控制在 40 字节以内，彻底解决 BUTTON_DATA_INVALID）
 def panel_main_keyboard(instance_id: str, auth_ok: bool = True) -> InlineKeyboardMarkup:
     rows = []
     if auth_ok:
@@ -402,9 +431,9 @@ def make_panel_text(instance_id: str, ip: str, status: str, client: Optional[XUI
     auth_warning = ""
     if auth_error:
         auth_warning = (
-            "\n⚠️ **提示：面板账密未同步**\n"
+            "\n⚠️ **提示：面板账密尚未同步**\n"
             "服务正在运行，但 API 登录尚未通过。\n"
-            "👉 请点击下方 **【🔑 恢复默认账密】** 按钮即可一键修复！\n"
+            "👉 请点击下方 **【🔑 恢复默认账密】** 按钮即可一键自愈！\n"
         )
 
     return (
@@ -416,17 +445,20 @@ def make_panel_text(instance_id: str, ip: str, status: str, client: Optional[XUI
         f"👤 账号：`{user}` | 🔑 密码：`{mask_secret(password)}`\n"
         f"{auth_warning}"
         "━━━━━━━━━━━━━━━━━━\n"
-        "💡 **核心功能**：\n"
-        "• **Reality**：固定 200G 流量，一键生成 VLESS+REALITY。\n"
-        "• **MTP**：固定 500G 流量，一键生成 Telegram 专属代理。\n"
-        "• **节点管控**：查看入站端口、流量清零、一键删除节点。"
+        "💡 **快捷操作指南**：\n"
+        "• **Reality**：固定 200G 流量，一键生成 VLESS+REALITY 节点。\n"
+        "• **MTP**：固定 500G 流量，一键生成 Telegram 专属直连代理。\n"
+        "• **节点管控**：查看入站端口、一键清零流量、删除节点。"
     )
 
 async def answer_or_edit(call: CallbackQuery, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
         await call.message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
-    except TelegramBadRequest:
-        await call.message.answer(text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await call.answer()
+        else:
+            await call.message.answer(text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
 
 class PanelFSM(StatesGroup):
     custom_port = State()
@@ -449,14 +481,16 @@ async def install_xui(instance_id: str, ip_hint: Optional[str] = None) -> tuple[
         save_panel_record(instance_id, target.host, XUI_USERNAME, XUI_PASSWORD, XUI_PORT, "/", "http")
         return True, "✅ 3x-ui 安装已完成，服务已拉起！"
 
-# 入口路由
+# ================= 路由与首页 =================
+
 @router.callback_query(F.data.startswith("run_sh:xui:") | F.data.startswith("run_sh:panel:"))
 async def show_unified_panel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     parts = call.data.split(":")
     instance_id = parts[2]
     ip = parts[3] if len(parts) > 3 else None
-    if ip: save_panel_record(instance_id, ip)
+    if is_valid_ip(ip):
+        save_panel_record(instance_id, ip)
     await show_panel(call, instance_id, ip)
 
 async def show_panel(call: CallbackQuery, instance_id: str, ip_hint: Optional[str] = None):
@@ -477,26 +511,42 @@ async def show_panel(call: CallbackQuery, instance_id: str, ip_hint: Optional[st
         text = make_panel_text(instance_id, target.host, status, client, auth_error)
         await answer_or_edit(call, text, panel_main_keyboard(instance_id, auth_ok=(not auth_error and running)))
     except Exception as exc:
-        await answer_or_edit(call, f"❌ 无法读取服务器信息：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ **无法连接服务器**\n\n错误原因：`{exc}`",
+            inline_kb([[("🔙 返回上一级", f"srv_sel:{instance_id}")]])
+        )
 
 @router.callback_query(F.data.startswith("p:back:"))
 async def cb_back(call: CallbackQuery, state: FSMContext):
     await state.clear()
     instance_id = call.data.split(":")[2]
+    await call.answer()
     await show_panel(call, instance_id)
 
 @router.callback_query(F.data.startswith("p:ins:"))
 async def cb_install(call: CallbackQuery, state: FSMContext):
     await state.clear()
     instance_id = call.data.split(":")[2]
-    await call.answer("正在极速安装 3x-ui v3.5.0...")
+    await call.answer("正在安装 3x-ui v3.5.0...")
     await answer_or_edit(call, f"📦 正在部署 3x-ui 面板 (`{instance_id}`)...\n\n固定版本：`{XUI_VERSION}`\n固定端口：`{XUI_PORT}`\n默认账密：`admin / admin`\n\n请稍候 20-30 秒。")
 
     try:
         ok, result = await install_xui(instance_id)
-        await answer_or_edit(call, f"🎉 **操作结果**\n\n{result}", panel_main_keyboard(instance_id, True))
+        if ok:
+            await answer_or_edit(call, f"🎉 **操作结果**\n\n{result}", panel_main_keyboard(instance_id, True))
+        else:
+            await answer_or_edit(
+                call,
+                f"❌ **安装失败**\n\n```text\n{result}\n```",
+                inline_kb([[("🔄 重试安装", f"p:ins:{instance_id}")], [("🔙 返回面板", f"p:back:{instance_id}")]])
+            )
     except Exception as exc:
-        await answer_or_edit(call, f"❌ **安装失败**\n\n`{exc}`", panel_main_keyboard(instance_id, False))
+        await answer_or_edit(
+            call,
+            f"❌ **安装失败**\n\n`{exc}`",
+            inline_kb([[("🔄 重试安装", f"p:ins:{instance_id}")], [("🔙 返回面板", f"p:back:{instance_id}")]])
+        )
 
 async def ensure_client(instance_id: str) -> XUIClient:
     return await detect_xui_client(instance_id)
@@ -566,7 +616,11 @@ async def cb_add_reality(call: CallbackQuery, state: FSMContext):
         _, text = await create_reality_200g(instance_id)
         await answer_or_edit(call, text, inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]))
     except Exception as exc:
-        await answer_or_edit(call, f"❌ Reality 创建失败：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ Reality 创建失败：`{exc}`",
+            inline_kb([[("🔄 重试生成", f"p:rel:{instance_id}")], [("📋 返回面板", f"p:back:{instance_id}")]])
+        )
 
 # ================= MTP 500G =================
 async def create_mtp_500g(instance_id: str) -> tuple[bool, str]:
@@ -594,7 +648,11 @@ async def cb_add_mtp(call: CallbackQuery, state: FSMContext):
         _, text = await create_mtp_500g(instance_id)
         await answer_or_edit(call, text, inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]))
     except Exception as exc:
-        await answer_or_edit(call, f"❌ MTP 创建失败：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ MTP 创建失败：`{exc}`",
+            inline_kb([[("🔄 重试生成", f"p:mtp:{instance_id}")], [("📋 返回面板", f"p:back:{instance_id}")]])
+        )
 
 # ================= 自定义 Reality =================
 @router.callback_query(F.data.startswith("p:cus:"))
@@ -604,19 +662,34 @@ async def cb_custom_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(instance_id=instance_id)
     await state.set_state(PanelFSM.custom_port)
     await call.answer()
-    await answer_or_edit(call, "🧩 **自定义 Reality 节点**\n\n第 1 步：请输入端口 (1-65535)：")
+    await answer_or_edit(
+        call,
+        "🧩 **自定义 Reality 节点**\n\n第 1 步：请输入端口 (1-65535)：",
+        inline_kb([[("❌ 取消操作", f"p:cus_cancel:{instance_id}")]])
+    )
+
+@router.callback_query(F.data.startswith("p:cus_cancel:"))
+async def cb_custom_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    instance_id = call.data.split(":")[2]
+    await call.answer("已取消操作")
+    await show_panel(call, instance_id)
 
 @router.message(PanelFSM.custom_port)
 async def custom_port_message(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw == "0":
+        await state.clear()
+        return await message.answer("已取消自定义节点创建。")
     try:
-        port = int((message.text or "").strip())
+        port = int(raw)
         if not 1 <= port <= 65535: raise ValueError
     except ValueError:
-        return await message.answer("❌ 端口必须是 1-65535 的整数。")
+        return await message.answer("❌ 端口必须是 1-65535 的整数，请重新输入：")
 
     await state.update_data(port=port)
     await state.set_state(PanelFSM.custom_uuid)
-    await message.answer("第 2 步：请输入 UUID (留空直接发送 0 自动生成)：")
+    await message.answer("第 2 步：请输入 UUID (留空请直接发送 0 自动生成)：")
 
 @router.message(PanelFSM.custom_uuid)
 async def custom_uuid_message(message: Message, state: FSMContext):
@@ -632,13 +705,13 @@ async def custom_traffic_message(message: Message, state: FSMContext):
         traffic_gb = int((message.text or "").strip())
         if traffic_gb < 0: raise ValueError
     except ValueError:
-        return await message.answer("❌ 流量必须是 >= 0 的整数。")
+        return await message.answer("❌ 流量必须是 >= 0 的整数，请重新输入：")
 
     data = await state.get_data()
     instance_id, port, client_uuid = data["instance_id"], data["port"], data["client_uuid"]
     total_bytes = traffic_gb * 1024 * 1024 * 1024
     await state.clear()
-    await message.answer("🧩 正在创建节点...")
+    wait_msg = await message.answer("🧩 正在创建节点...")
 
     try:
         client = await ensure_client(instance_id)
@@ -665,11 +738,17 @@ async def custom_traffic_message(message: Message, state: FSMContext):
         }
         await client.request_json("POST", "/panel/api/inbounds/add", json=inbound)
         link = f"vless://{client_uuid}@{client.ip}:{port}?type=tcp&security=reality&pbk={quote(public_key)}&fp={REALITY_FP}&sni={REALITY_SNI}&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#Reality-Custom-{port}"
-        await message.answer(f"✅ **自定义 Reality 创建成功**\n\n端口：`{port}`\nUUID：`{client_uuid}`\n流量：`{traffic_gb} GB`\n\n节点链接：\n`{link}`", reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]), parse_mode="Markdown")
+        await wait_msg.edit_text(
+            f"✅ **自定义 Reality 创建成功**\n\n端口：`{port}`\nUUID：`{client_uuid}`\n流量：`{traffic_gb} GB`\n\n节点链接：\n`{link}`",
+            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]])
+        )
     except Exception as exc:
-        await message.answer(f"❌ 创建失败：`{exc}`")
+        await wait_msg.edit_text(
+            f"❌ 创建失败：`{exc}`",
+            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]])
+        )
 
-# ================= 节点管控与服务操作 =================
+# ================= 节点管控列表与清零/删除 =================
 async def render_node_list(call: CallbackQuery, instance_id: str, page: int = 0):
     client = await ensure_client(instance_id)
     data = await client.request_json("GET", "/panel/api/inbounds/list")
@@ -684,26 +763,35 @@ async def render_node_list(call: CallbackQuery, instance_id: str, page: int = 0)
     lines = ["📋 **节点列表与端口管控**\n━━━━━━━━━━━━━━━━━━"]
     rows = []
 
-    for item in current:
-        iid, protocol, port = item.get("id"), str(item.get("protocol") or "unknown").upper(), item.get("port")
-        remark, enable = str(item.get("remark") or f"inbound-{iid}"), item.get("enable", True)
-        used = int(item.get("up") or 0) + int(item.get("down") or 0)
-        total = int(item.get("total") or 0)
-        status = "🟢" if enable else "🔴"
+    if not items:
+        lines.append("\n📭 当前面板尚未创建任何入站节点。")
+    else:
+        for item in current:
+            iid, protocol, port = item.get("id"), str(item.get("protocol") or "unknown").upper(), item.get("port")
+            remark, enable = str(item.get("remark") or f"inbound-{iid}"), item.get("enable", True)
+            used = int(item.get("up") or 0) + int(item.get("down") or 0)
+            total = int(item.get("total") or 0)
+            status = "🟢" if enable else "🔴"
 
-        lines.append(f"{status} **#{iid} {remark}**\n   `{protocol}` · 端口 `{port}` · 流量 `{fmt_bytes(used)}` / `{fmt_total(total)}`\n")
-        rows.append([
-            (f"🧹 清零 #{iid}", f"pn:rst:{instance_id}:{iid}:{page}"),
-            (f"🗑️ 删除 #{iid}", f"pn:del:{instance_id}:{iid}:{page}"),
-        ])
+            lines.append(f"{status} **#{iid} {remark}**\n   `{protocol}` · 端口 `{port}` · 流量 `{fmt_bytes(used)}` / `{fmt_total(total)}`\n")
+            rows.append([
+                (f"🧹 清零 #{iid}", f"pn:rst:{instance_id}:{iid}:{page}"),
+                (f"🗑️ 删除 #{iid}", f"pn:del:{instance_id}:{iid}:{page}"),
+            ])
 
     nav = []
     if page > 0: nav.append(("⬅️ 上一页", f"p:list:{instance_id}:{page-1}"))
-    nav.append((f"{page+1}/{total_pages}", f"p:list:{instance_id}:{page}"))
+    nav.append((f"{page+1}/{total_pages}", f"p:page_info:{page+1}:{total_pages}"))
     if page < total_pages - 1: nav.append(("下一页 ➡️", f"p:list:{instance_id}:{page+1}"))
-    rows.append(nav)
+    if nav: rows.append(nav)
+
     rows.append([("🔙 返回面板", f"p:back:{instance_id}")])
     await answer_or_edit(call, "\n".join(lines), inline_kb(rows))
+
+@router.callback_query(F.data.startswith("p:page_info:"))
+async def cb_page_info(call: CallbackQuery):
+    parts = call.data.split(":")
+    await call.answer(f"ℹ️ 当前处于第 {parts[2]}/{parts[3]} 页", show_alert=False)
 
 @router.callback_query(F.data.startswith("p:list:"))
 async def cb_list(call: CallbackQuery, state: FSMContext):
@@ -714,19 +802,28 @@ async def cb_list(call: CallbackQuery, state: FSMContext):
     try:
         await render_node_list(call, instance_id, page)
     except Exception as exc:
-        await answer_or_edit(call, f"❌ 节点读取失败：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ 节点列表读取失败：`{exc}`",
+            inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]])
+        )
 
 @router.callback_query(F.data.startswith("pn:rst:"))
 async def cb_reset_node(call: CallbackQuery, state: FSMContext):
     parts = call.data.split(":")
     instance_id, inbound_id, page = parts[2], parts[3], int(parts[4])
-    await call.answer("正在清零…")
+    await call.answer("正在清零流量…")
     try:
         client = await ensure_client(instance_id)
         await client.request_json("POST", f"/panel/api/inbounds/resetAllClientTraffics/{inbound_id}")
+        await call.answer(f"✅ 节点 #{inbound_id} 流量已清零！", show_alert=True)
         await render_node_list(call, instance_id, page)
     except Exception as exc:
-        await answer_or_edit(call, f"❌ 清零失败：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ 清零失败：`{exc}`",
+            inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]])
+        )
 
 @router.callback_query(F.data.startswith("pn:del:"))
 async def cb_del_node(call: CallbackQuery, state: FSMContext):
@@ -737,24 +834,30 @@ async def cb_del_node(call: CallbackQuery, state: FSMContext):
     confirm_markup = inline_kb([
         [
             ("⚠️ 确认删除", f"pn:del_cf:{instance_id}:{inbound_id}:{page}"),
-            ("取消", f"p:list:{instance_id}:{page}")
+            ("❌ 取消", f"p:list:{instance_id}:{page}")
         ]
     ])
-    await answer_or_edit(call, f"⚠️ **确认删除节点 #{inbound_id}？**", confirm_markup)
+    await answer_or_edit(call, f"⚠️ **确认删除节点 #{inbound_id}？**\n\n删除后该入站端口和链接将立即失效。", confirm_markup)
 
 @router.callback_query(F.data.startswith("pn:del_cf:"))
 async def cb_del_node_confirm(call: CallbackQuery, state: FSMContext):
     parts = call.data.split(":")
     instance_id, inbound_id, page = parts[2], parts[3], int(parts[4])
-    await call.answer("正在删除…")
+    await call.answer("正在删除节点…")
     try:
         client = await ensure_client(instance_id)
         await client.request_json("POST", f"/panel/api/inbounds/del/{inbound_id}")
+        await call.answer(f"✅ 节点 #{inbound_id} 已删除！", show_alert=True)
         await render_node_list(call, instance_id, page)
     except Exception as exc:
-        await answer_or_edit(call, f"❌ 删除失败：`{exc}`")
+        await answer_or_edit(
+            call,
+            f"❌ 删除失败：`{exc}`",
+            inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]])
+        )
 
 # ================= 启停 / 重置账密 / 卸载 =================
+
 async def systemctl_xui(instance_id: str, action: str) -> tuple[bool, str]:
     target = resolve_ssh_target(instance_id)
     code, out, err = await ssh_exec(target, f"systemctl {action} x-ui && systemctl is-active x-ui", timeout=60)
@@ -763,16 +866,28 @@ async def systemctl_xui(instance_id: str, action: str) -> tuple[bool, str]:
 @router.callback_query(F.data.startswith("p:stop:"))
 async def cb_stop(call: CallbackQuery, state: FSMContext):
     instance_id = call.data.split(":")[2]
-    await call.answer("正在停止…")
-    ok, result = await systemctl_xui(instance_id, "stop")
-    await answer_or_edit(call, "🛑 **x-ui 服务已停止**" if ok else f"❌ 停止失败：`{result}`", inline_kb([[("🔄 刷新", f"p:back:{instance_id}")]]))
+    await call.answer("正在停止服务…")
+    try:
+        ok, result = await systemctl_xui(instance_id, "stop")
+        if ok:
+            await answer_or_edit(call, "🛑 **3x-ui 服务已成功停止。**", inline_kb([[("🔄 刷新面板", f"p:back:{instance_id}")]]))
+        else:
+            await answer_or_edit(call, f"❌ 停止失败：`{result}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
+    except Exception as exc:
+        await answer_or_edit(call, f"❌ 操作异常：`{exc}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
 
 @router.callback_query(F.data.startswith("p:rst:"))
 async def cb_restart(call: CallbackQuery, state: FSMContext):
     instance_id = call.data.split(":")[2]
-    await call.answer("正在重启…")
-    ok, result = await systemctl_xui(instance_id, "restart")
-    await answer_or_edit(call, "🚀 **x-ui 重启成功**" if ok else f"❌ 重启失败：`{result}`", inline_kb([[("🔄 刷新", f"p:back:{instance_id}")]]))
+    await call.answer("正在重启服务…")
+    try:
+        ok, result = await systemctl_xui(instance_id, "restart")
+        if ok:
+            await answer_or_edit(call, "🚀 **3x-ui 服务已重启并恢复运行！**", inline_kb([[("🔄 刷新面板", f"p:back:{instance_id}")]]))
+        else:
+            await answer_or_edit(call, f"❌ 重启失败：`{result}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
+    except Exception as exc:
+        await answer_or_edit(call, f"❌ 操作异常：`{exc}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
 
 async def reset_credentials(instance_id: str) -> tuple[bool, str]:
     target = resolve_ssh_target(instance_id)
@@ -787,29 +902,66 @@ async def reset_credentials(instance_id: str) -> tuple[bool, str]:
 async def cb_reset_credentials(call: CallbackQuery, state: FSMContext):
     instance_id = call.data.split(":")[2]
     await call.answer("正在强制重置账密…")
-    ok, result = await reset_credentials(instance_id)
-    if ok:
-        await answer_or_edit(call, f"✅ **账密重置完成**\n\n{result}", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
-    else:
-        await answer_or_edit(call, f"❌ 恢复失败：`{result}`")
+    await answer_or_edit(call, "⏳ **正在调用底层命令强制重置账密，请稍候...**")
+    try:
+        ok, result = await reset_credentials(instance_id)
+        if ok:
+            await answer_or_edit(call, f"✅ **账密重置完成**\n\n{result}", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
+        else:
+            await answer_or_edit(call, f"❌ 恢复失败：`{result}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
+    except Exception as exc:
+        await answer_or_edit(call, f"❌ 异常失败：`{exc}`", inline_kb([[("🔙 返回面板", f"p:back:{instance_id}")]]))
 
 @router.callback_query(F.data.startswith("p:un:"))
 async def cb_uninstall(call: CallbackQuery, state: FSMContext):
     instance_id = call.data.split(":")[2]
+    await call.answer()
     markup = inline_kb([
-        [("⚠️ 确认彻底卸载", f"p:un_cf:{instance_id}"), ("取消", f"p:back:{instance_id}")]
+        [("⚠️ 确认彻底卸载", f"p:un_cf:{instance_id}"), ("❌ 取消", f"p:back:{instance_id}")]
     ])
-    await answer_or_edit(call, "🗑️ **彻底卸载 3x-ui**\n\n此操作将停止服务并删除所有入站与配置，是否继续？", markup)
+    await answer_or_edit(
+        call,
+        "🗑️ **彻底卸载 3x-ui**\n\n此操作将停止服务并彻底删除所有入站与配置数据库，是否继续？",
+        markup
+    )
 
 @router.callback_query(F.data.startswith("p:un_cf:"))
 async def cb_uninstall_confirm(call: CallbackQuery, state: FSMContext):
     instance_id = call.data.split(":")[2]
     await call.answer("正在卸载…")
-    target = resolve_ssh_target(instance_id)
-    command = "systemctl disable --now x-ui 2>/dev/null || true; rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui 2>/dev/null || true; echo UNINSTALL_DONE"
-    code, out, _ = await ssh_exec(target, command, timeout=60)
-    mark_panel_uninstalled(instance_id)
-    await answer_or_edit(call, "✅ **3x-ui 已彻底卸载**", inline_kb([[("🔄 重新安装", f"p:ins:{instance_id}")]]))
+    await answer_or_edit(call, "⏳ **正在远程清理 3x-ui 服务与文件，请稍候 5-10 秒...**")
+
+    try:
+        target = resolve_ssh_target(instance_id)
+        command = (
+            "systemctl stop x-ui 2>/dev/null || true; "
+            "systemctl disable x-ui 2>/dev/null || true; "
+            "pkill -9 -f x-ui 2>/dev/null || true; "
+            "pkill -9 -f xray-linux 2>/dev/null || true; "
+            "rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui /etc/systemd/system/x-ui.service /lib/systemd/system/x-ui.service 2>/dev/null || true; "
+            "systemctl daemon-reload 2>/dev/null || true; "
+            "echo UNINSTALL_DONE"
+        )
+        code, out, _ = await ssh_exec(target, command, timeout=60)
+        mark_panel_uninstalled(instance_id)
+        await answer_or_edit(
+            call,
+            "✅ **3x-ui 已彻底卸载！**\n\n所有相关服务与数据已安全清理完毕。",
+            inline_kb([
+                [("🛠️ 重新安装 3x-ui", f"p:ins:{instance_id}")],
+                [("🔙 返回节点配置列表", "back_to_srv_list")]
+            ])
+        )
+    except Exception as exc:
+        logger.exception("uninstall failed")
+        await answer_or_edit(
+            call,
+            f"❌ **卸载失败**\n\n原因：`{exc}`",
+            inline_kb([
+                [("🔄 重试卸载", f"p:un_cf:{instance_id}")],
+                [("🔙 返回面板", f"p:back:{instance_id}")]
+            ])
+        )
 
 def get_panel_router() -> Router:
     return router
