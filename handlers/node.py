@@ -237,7 +237,8 @@ def check_all_scripts_status(instance_id: str, ip: str) -> dict:
     try:
         combined_cmd = """
         if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi bbr; then echo 'RES_bbr:1'; else echo 'RES_bbr:0'; fi
-        if systemctl is-active --quiet x-ui || test -f /usr/local/x-ui/x-ui; then echo 'RES_xui:1'; else echo 'RES_xui:0'; fi
+        # 只把 systemd active 当作“运行中”；已安装但停止的 x-ui 必须显示为 🔴。
+        if systemctl is-active --quiet x-ui; then echo 'RES_xui:1'; else echo 'RES_xui:0'; fi
         """
         stdin, stdout, stderr = client.exec_command(combined_cmd, timeout=5.0)
         output = stdout.read().decode('utf-8')
@@ -300,7 +301,14 @@ async def show_script_options(call: types.CallbackQuery):
         is_running = status_dict.get(script["id"], False)
         status_icon = "🟢" if is_running else "🔴"
         button_text = f"{status_icon} {script['label']}"
-        cb_data = f"run_sh:{script['id']}:{instance_id}:{public_ip}"
+        
+        # 传递 IP 确保后续面板无需查库直接连接
+        if script["id"] == "xui":
+            # 告诉 panel_action：这是从 SWAS 进入的，便于修复“返回上一级”路径。(需要你当前作用域有 acc_id)
+            cb_data = f"run_sh:xui:{instance_id}:{public_ip}:swas:{acc_id}"
+        else:
+            cb_data = f"run_sh:{script['id']}:{instance_id}:{public_ip}"
+            
         builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
     
     if not instance_id.startswith("i-"):
