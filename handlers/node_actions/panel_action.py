@@ -16,9 +16,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
-from urllib.parse import urlparse
 
-
+from urllib.parse import urlparse, parse_qs
 import requests
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -704,21 +703,33 @@ async def create_reality_200g(instance_id: str) -> tuple[bool, str]:
     }
 
     await client.request_json("POST", "/panel/api/inbounds/add", json=inbound)
-    link = f"vless://{client_uuid}@{client.ip}:{port}?type=tcp&security=reality&pbk={quote(public_key)}&fp={REALITY_FP}&sni={REALITY_SNI}&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#{quote('Reality-200G')}"
-    return True, (
-        "⚡️ **Reality 200G 生成成功**\n\n"
-        f"端口：`{port}`\nUUID：`{client_uuid}`\nShort ID：`{short_id}`\n流量：`200 GB`\n公钥：`{public_key}`\n\n节点链接：\n`{link}`"
+    # 🌟 修改点 1：把链接最后的 #Reality-200G 改成 #Reality
+    link = f"vless://{client_uuid}@{client.ip}:{port}?type=tcp&security=reality&pbk={quote(public_key)}&fp={REALITY_FP}&sni={REALITY_SNI}&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#Reality"
+    
+    # 🌟 修改点 2：使用 <b> 加粗，使用 <code> 实现隐形的一键复制
+    text = (
+        f"⚡️ <b>Reality 生成成功</b>\n\n"
+        f"服务器IP：<code>{client.ip}</code>\n"
+        f"服务器端口：<code>{port}</code>\n\n"
+        f"节点链接：\n<code>{link}</code>"
     )
+    return True, text
 
 @router.callback_query(F.data.startswith("p:rel:"))
 async def cb_add_reality(call: CallbackQuery, state: FSMContext):
     await state.clear()
     instance_id = call.data.split(":")[2]
-    await call.answer("正在生成 Reality…")
+    await call.answer("正在生成 Reality...")
     try:
         _, text = await create_reality_200g(instance_id)
-        await answer_or_edit(call, text, inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]))
+        # 🌟 核心修改：弃用 answer_or_edit，改用原生方法并加上 HTML 解析
+        await call.message.edit_text(
+            text, 
+            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]),
+            parse_mode="HTML"
+        )
     except Exception as exc:
+        # 报错的这里不用动
         await answer_or_edit(
             call,
             f"❌ Reality 创建失败：`{exc}`",
@@ -741,17 +752,33 @@ async def create_mtp_500g(instance_id: str) -> tuple[bool, str]:
     }
     await client.request_json("POST", "/panel/api/inbounds/add", json=inbound)
     link = f"tg://proxy?server={client.ip}&port={port}&secret={secret}"
-    return True, f"✨ **MTP 500G 生成成功**\n\n端口：`{port}`\nSecret：`{secret}`\n流量：`500 GB`\n\nTelegram 代理链接：\n`{link}`"
+    
+    # 🌟 修改点：按要求的格式输出排版
+    text = (
+        f"✨ <b>MTP 500G 生成成功</b>\n\n"
+        f"服务器IP：<code>{client.ip}</code>\n"
+        f"服务器端口：<code>{port}</code>\n"
+        f"MTProxy Secret：<code>{secret}</code>\n\n"
+        f"TG一键链接:\n"
+        f"{link}"
+    )
+    return True, text
 
 @router.callback_query(F.data.startswith("p:mtp:"))
 async def cb_add_mtp(call: CallbackQuery, state: FSMContext):
     await state.clear()
     instance_id = call.data.split(":")[2]
-    await call.answer("正在生成 MTP…")
+    await call.answer("正在生成 MTP...")
     try:
         _, text = await create_mtp_500g(instance_id)
-        await answer_or_edit(call, text, inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]))
+        # 🌟 核心修改：弃用 answer_or_edit，改用原生方法并加上 HTML 解析
+        await call.message.edit_text(
+            text, 
+            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]),
+            parse_mode="HTML"
+        )
     except Exception as exc:
+        # 报错的这里不用动
         await answer_or_edit(
             call,
             f"❌ MTP 创建失败：`{exc}`",
@@ -801,12 +828,41 @@ async def custom_port_message(message: Message, state: FSMContext):
 @router.message(PanelFSM.custom_secret)
 async def custom_secret_message(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
+    
+    # 1. 自动生成
     if raw in ["", "0"]:
         import secrets
+        # 注意：这里需要确保你的上下文里定义了 REALITY_SNI 变量
         secret = "ee" + secrets.token_hex(16) + REALITY_SNI.encode("utf-8").hex()
-    else:
-        secret = raw
         
+    # 2. 智能解析用户输入
+    else:
+        # 如果用户手滑粘贴了完整的 TG 代理链接，自动提取 secret
+        if "secret=" in raw:
+            try:
+                parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+                qs = parse_qs(parsed.query)
+                if "secret" in qs:
+                    secret = qs["secret"][0]
+                else:
+                    secret = raw.split("secret=")[1].split("&")[0].strip()
+            except Exception:
+                secret = raw.split("secret=")[1].split("&")[0].strip()
+        else:
+            secret = raw
+            
+        # 清除可能带入的空格或换行
+        secret = secret.strip()
+
+        # 3. 严格格式校验：MTProto 密钥必须是纯十六进制字符
+        if not all(c in "0123456789abcdefABCDEF" for c in secret):
+            return await message.answer(
+                "❌ **密钥格式不正确**\n\n"
+                "MTProto 密钥只能包含数字 (0-9) 和字母 (a-f)。\n"
+                "👉 请重新输入，或者直接回复 `0` 让系统为您自动生成："
+            )
+
+    # 验证通过，进入下一步
     await state.update_data(secret=secret)
     await state.set_state(PanelFSM.custom_traffic)
     await message.answer("第 3 步：请输入流量限制 (GB)，输入 0 为不限流量：")
@@ -830,30 +886,47 @@ async def custom_traffic_message(message: Message, state: FSMContext):
         email = f"custom_mtp_{port}_{int(time.time())}"
 
         inbound = {
-            "enable": True,
-            "remark": f"MTP-Custom-{port}",
-            "listen": "",
+            "enable": True, 
+            "remark": f"MTP-Custom-{port}", 
+            "listen": "", 
             "port": port,
-            "protocol": "mtproto",
-            "expiryTime": 0,
+            "protocol": "mtproto", 
+            "expiryTime": 0, 
             "total": total_bytes,
             "settings": {
-                # 🌟 修复：严格使用 secret 字段，并保留 email 用于流量统计
-                "clients": [{"email": email, "secret": secret}]
+                "fakeTlsDomain": "www.cloudflare.com",
+                "clients": [{
+                    "email": email, 
+                    "secret": secret, 
+                    "enable": True, 
+                    "totalGB": total_bytes, 
+                    "expiryTime": 0, 
+                    "adTag": ""
+                }]
             },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "none"
-            },
-            "sniffing": {"enabled": False, "destOverride": []}
+            "streamSettings": {}, 
+            "sniffing": {"enabled": False}
         }
 
         await client.request_json("POST", "/panel/api/inbounds/add", json=inbound)
-        link = f"https://t.me/proxy?server={client.ip}&port={port}&secret={secret}"
         
+        link = f"tg://proxy?server={client.ip}&port={port}&secret={secret}"
+        
+        # 🌟 修改点：按要求的格式输出排版
+        text = (
+            f"✅ <b>自定义 MTP 创建成功</b>\n\n"
+            f"服务器IP：<code>{client.ip}</code>\n"
+            f"服务器端口：<code>{port}</code>\n"
+            f"MTProxy Secret：<code>{secret}</code>\n\n"
+            f"TG一键链接:\n"
+            f"{link}"
+        )
+        
+        # ⚠️ 极其关键的一步：必须加上 parse_mode="HTML"
         await wait_msg.edit_text(
-            f"✅ **自定义 MTP 创建成功**\n\n端口：`{port}`\n流量：`{traffic_gb} GB`\n密钥：`{secret}`\n\nTelegram 代理链接：\n`{link}`",
-            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]])
+            text,
+            reply_markup=inline_kb([[("📋 返回面板", f"p:back:{instance_id}")]]),
+            parse_mode="HTML"
         )
     except Exception as exc:
         await wait_msg.edit_text(
@@ -935,27 +1008,121 @@ async def cb_outbound_start(call: CallbackQuery, state: FSMContext):
     
     try:
         client = await ensure_client(instance_id)
-        # 获取该节点的具体配置以拿到真实端口号
+        # 获取该节点的具体配置
         data = await client.request_json("GET", f"/panel/api/inbounds/get/{inbound_id}")
         inbound_obj = data.get("obj", {})
         port = inbound_obj.get("port")
+        protocol = inbound_obj.get("protocol")
         
         if not port:
             return await call.answer("❌ 无法获取该节点端口", show_alert=True)
             
+        # 解析底层 JSON 配置
+        settings = inbound_obj.get("settings", {})
+        if isinstance(settings, str): settings = json.loads(settings)
+        stream_settings = inbound_obj.get("streamSettings", {})
+        if isinstance(stream_settings, str): stream_settings = json.loads(stream_settings)
+        
         await state.clear()
-        await state.update_data(instance_id=instance_id, port=port, page=page)
+        # 将必要参数向下传递给接收器
+        await state.update_data(instance_id=instance_id, port=port, page=page, inbound_id=inbound_id, protocol=protocol)
         await state.set_state(OutboundFSM.proxy_uri)
         
-        text = (
-            f"🔌 **设置节点 #{inbound_id} (端口 {port}) 的落地 IP**\n\n"
-            "支持 `socks5` 或 `http` 协议代理。\n"
-            "👉 **格式示例：**\n"
-            "`socks5://用户名:密码@192.168.1.1:1080`\n"
-            "`http://192.168.1.1:8080` (无密码直写)\n\n"
-            "请直接回复以上格式的代理 URI。如果需要**清除落地代理并恢复直连**，请回复数字 `0`："
+        if protocol == "mtproto":
+            # ====== MTP 协议面板 ======
+            clients = settings.get("clients", [])
+            secret = clients[0].get("secret") if clients else ""
+            # 🌟 提取当前的广告标签
+            current_ad_tag = clients[0].get("adTag", "") if clients else ""
+            
+            # 智能截取核心密钥：跳过开头的 "ee"，提取接下来的 32 位
+            core_secret = secret[2:34] if secret.startswith("ee") and len(secret) >= 34 else secret
+            
+            link = f"tg://proxy?server={client.ip}&port={port}&secret={secret}"
+            
+            text = (
+                f"✨ <b>MTP 节点信息</b>\n\n"
+                f"服务器IP：<code>{client.ip}</code>\n"
+                f"服务器端口：<code>{port}</code>\n"
+                f"MTProxy Secret：<code>{secret}</code>\n\n"
+                f"TG一键链接:\n"
+                f"{link}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📢 <b>设置广告标签 (赞助频道)</b>\n\n"
+                f"<b>1.</b> 官方代理机器人：@MTProxybot，发送命令 <code>/newproxy</code>。\n"
+                f"<b>2.</b> IP与端口：<code>{client.ip}:{port}</code>\n"
+                f"<b>3.</b> 密钥：<code>{core_secret}</code> (👈点此复制)\n"
+                f"<b>4.</b> 注册成功后，机器人会回复一段 Tag（由32位字母数字组成）。(完成后发送 <code>/myproxies</code> 可绑定您的频道)\n\n"
+                f"👇 <b>请直接回复获取到的 32 位 Tag</b> (清除回复 <code>0</code>)：\n"
+            )
+            
+            # 🌟 动态追加当前 Tag 状态
+            if current_ad_tag:
+                text += f"当前tag：<code>{current_ad_tag}</code>"
+            else:
+                text += f"当前tag：无"
+        else:
+            # ====== Reality / VLESS 协议面板 ======
+            clients = settings.get("clients", [])
+            uuid_str = clients[0].get("id") if clients else ""
+            reality_settings = stream_settings.get("realitySettings", {})
+            pub_key = reality_settings.get("settings", {}).get("publicKey", "")
+            short_id = reality_settings.get("shortIds", [""])[0] if reality_settings.get("shortIds") else ""
+            sni = reality_settings.get("serverNames", ["www.cloudflare.com"])[0] if reality_settings.get("serverNames") else ""
+            fp = reality_settings.get("fingerprint", "chrome")
+            
+            link = f"vless://{uuid_str}@{client.ip}:{port}?type=tcp&security=reality&pbk={quote(pub_key)}&fp={fp}&sni={sni}&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#Reality"
+            
+            # 🌟 新增逻辑：拉取底层 Xray 路由配置，查找当前端口的落地 IP
+            current_outbound_uri = "无 (默认直连)"
+            try:
+                settings_resp = await client.request_json("GET", "/panel/api/setting/all")
+                xray_config_str = settings_resp.get("obj", {}).get("xrayTemplateConfig", "{}")
+                xray_config = json.loads(xray_config_str)
+                outbound_tag = f"outbound-{port}"
+                
+                # 遍历寻找有没有当前端口专属的转发规则
+                for out in xray_config.get("outbounds", []):
+                    if out.get("tag") == outbound_tag:
+                        proto = out.get("protocol", "")
+                        servers = out.get("settings", {}).get("servers", [])
+                        if servers:
+                            addr = servers[0].get("address", "")
+                            p = servers[0].get("port", "")
+                            users = servers[0].get("users", [])
+                            
+                            auth = ""
+                            if users and users[0].get("user"):
+                                u = users[0].get("user")
+                                pw = users[0].get("pass", "")
+                                auth = f"{u}:{pw}@" if pw else f"{u}@"
+                                
+                            current_outbound_uri = f"{proto}://{auth}{addr}:{p}"
+                        break
+            except Exception:
+                pass # 解析失败时静默，保持显示“无 (默认直连)”
+            
+            text = (
+                f"⚡️ <b>Reality 节点信息</b>\n\n"
+                f"服务器IP：<code>{client.ip}</code>\n"
+                f"服务器端口：<code>{port}</code>\n\n"
+                f"节点链接：\n<code>{link}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔌 <b>设置节点 #{inbound_id} (端口 {port}) 的落地 IP</b>\n\n"
+                f"支持 <code>socks5</code> 或 <code>http</code> 协议代理。\n"
+                f"👉 <b>格式示例：</b>\n"
+                f"<code>socks5://用户名:密码@192.168.1.1:1080</code>\n"
+                f"<code>http://192.168.1.1:8080</code> (无密码直写)\n\n"
+                f"请直接回复以上格式的代理 URI。如果需要<b>清除落地代理并恢复直连</b>，请回复数字 <code>0</code>：\n\n"
+                f"当前落地IP：<code>{current_outbound_uri}</code>"
+            )
+
+        # 这里使用 HTML 解析模式
+        await call.message.edit_text(
+            text, 
+            reply_markup=inline_kb([[("❌ 取消操作", f"p:list:{instance_id}:{page}")]]), 
+            parse_mode="HTML"
         )
-        await answer_or_edit(call, text, inline_kb([[("❌ 取消操作", f"p:list:{instance_id}:{page}")]]))
     except Exception as e:
         await call.answer(f"❌ 发生错误: {e}", show_alert=True)
 
@@ -964,133 +1131,119 @@ async def cb_outbound_process(message: Message, state: FSMContext):
     uri = (message.text or "").strip()
     data = await state.get_data()
     instance_id, port, page = data["instance_id"], data["port"], data["page"]
+    inbound_id, protocol = data["inbound_id"], data["protocol"]
     await state.clear()
     
-    wait_msg = await message.answer("🔄 正在修改 Xray 底层路由配置并重启核心...")
-    
-    try:
-        client = await ensure_client(instance_id)
-        # 1. 拉取当前全局 Xray 配置
-        settings_resp = await client.request_json("GET", "/panel/api/setting/all")
-        settings = settings_resp.get("obj", {})
-        xray_config_str = settings.get("xrayTemplateConfig", "{}")
-        xray_config = json.loads(xray_config_str)
-        
-        inbound_tag = f"inbound-{port}"
-        outbound_tag = f"outbound-{port}"
-        
-        # 2. 清理当前端口旧的路由与出站规则
-        if "routing" not in xray_config: xray_config["routing"] = {"rules": []}
-        if "rules" not in xray_config["routing"]: xray_config["routing"]["rules"] = []
-        if "outbounds" not in xray_config: xray_config["outbounds"] = []
-        
-        xray_config["routing"]["rules"] = [r for r in xray_config["routing"]["rules"] if r.get("outboundTag") != outbound_tag]
-        xray_config["outbounds"] = [o for o in xray_config["outbounds"] if o.get("tag") != outbound_tag]
-        
-        # 3. 注入新规则（如果用户不是回复 0）
-        if uri != "0":
-            parsed = urlparse(uri if "://" in uri else f"http://{uri}")
-            if parsed.scheme not in ["socks5", "socks", "http"]:
-                return await wait_msg.edit_text("❌ 仅支持 socks5 或 http 协议代理！", reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]))
+    if protocol == "mtproto":
+        # ====== 处理 MTP 广告标签注入 ======
+        wait_msg = await message.answer("🔄 正在修改 MTP 广告标签并同步至面板...")
+        try:
+            client = await ensure_client(instance_id)
+            resp = await client.request_json("GET", f"/panel/api/inbounds/get/{inbound_id}")
+            inbound_data = resp.get("obj", {})
+            
+            settings = inbound_data.get("settings", {})
+            if isinstance(settings, str): settings = json.loads(settings)
+            
+            # 清除或注入广告标签
+            ad_tag = "" if uri == "0" else uri
+            if "clients" in settings and len(settings["clients"]) > 0:
+                settings["clients"][0]["adTag"] = ad_tag
                 
-            users = []
-            if parsed.username:
-                users.append({"user": parsed.username, "pass": parsed.password or ""})
-                
-            new_outbound = {
-                "tag": outbound_tag,
-                "protocol": "socks" if "socks" in parsed.scheme else "http",
-                "settings": {
-                    "servers": [{
-                        "address": parsed.hostname,
-                        "port": parsed.port,
-                        "users": users
-                    }]
+            inbound_data["settings"] = settings
+            
+            await client.request_json("POST", f"/panel/api/inbounds/update/{inbound_id}", json=inbound_data)
+            
+            action = "清除广告标签" if uri == "0" else "设置广告标签"
+            await wait_msg.edit_text(
+                f"✅ <b>端口 {port} {action}成功！</b>",
+                reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]),
+                parse_mode="HTML"
+            )
+        except Exception as exc:
+            await wait_msg.edit_text(f"❌ 修改失败：`{exc}`", reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]))
+            
+    else:
+        # ====== 处理 Reality 落地 IP 路由配置 ======
+        wait_msg = await message.answer("🔄 正在修改 Xray 底层路由配置并重启核心...")
+        try:
+            client = await ensure_client(instance_id)
+            settings_resp = await client.request_json("GET", "/panel/api/setting/all")
+            settings = settings_resp.get("obj", {})
+            xray_config_str = settings.get("xrayTemplateConfig", "{}")
+            xray_config = json.loads(xray_config_str)
+            
+            inbound_tag = f"inbound-{port}"
+            outbound_tag = f"outbound-{port}"
+            
+            # 1. 清理旧规则
+            if "routing" not in xray_config: xray_config["routing"] = {"rules": []}
+            if "rules" not in xray_config["routing"]: xray_config["routing"]["rules"] = []
+            if "outbounds" not in xray_config: xray_config["outbounds"] = []
+            
+            xray_config["routing"]["rules"] = [r for r in xray_config["routing"]["rules"] if r.get("outboundTag") != outbound_tag]
+            xray_config["outbounds"] = [o for o in xray_config["outbounds"] if o.get("tag") != outbound_tag]
+            
+            # 2. 注入新规则
+            if uri != "0":
+                parsed = urlparse(uri if "://" in uri else f"http://{uri}")
+                if parsed.scheme not in ["socks5", "socks", "http"]:
+                    return await wait_msg.edit_text("❌ 仅支持 socks5 或 http 协议代理！", reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]))
+                    
+                users = []
+                if parsed.username:
+                    users.append({"user": parsed.username, "pass": parsed.password or ""})
+                    
+                new_outbound = {
+                    "tag": outbound_tag,
+                    "protocol": "socks" if "socks" in parsed.scheme else "http",
+                    "settings": {
+                        "servers": [{
+                            "address": parsed.hostname,
+                            "port": parsed.port,
+                            "users": users
+                        }]
+                    }
                 }
-            }
-            new_rule = {
-                "type": "field",
-                "inboundTag": [inbound_tag],
-                "outboundTag": outbound_tag
-            }
+                new_rule = {
+                    "type": "field",
+                    "inboundTag": [inbound_tag],
+                    "outboundTag": outbound_tag
+                }
+                
+                xray_config["outbounds"].append(new_outbound)
+                xray_config["routing"]["rules"].append(new_rule)
+                
+            # 3. 提交并重启
+            settings["xrayTemplateConfig"] = json.dumps(xray_config, indent=2)
+            await client.request_json("POST", "/panel/api/setting/update", json=settings)
+            await client.request_json("POST", "/panel/api/setting/restart")
             
-            xray_config["outbounds"].append(new_outbound)
-            xray_config["routing"]["rules"].append(new_rule)
-            
-        # 4. 保存配置并重启 Xray
-        settings["xrayTemplateConfig"] = json.dumps(xray_config, indent=2)
-        await client.request_json("POST", "/panel/api/setting/update", json=settings)
-        await client.request_json("POST", "/panel/api/setting/restart")
-        
-        action = "清除落地直连" if uri == "0" else "设置落地代理"
-        await wait_msg.edit_text(
-            f"✅ **端口 {port} {action}成功！**\nXray 核心已重启生效。",
-            reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]])
-        )
-    except Exception as exc:
-        await wait_msg.edit_text(f"❌ 路由修改失败：`{exc}`", reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]))
-
-# ================= 流量重置与删除 =================
+            action = "清除落地直连" if uri == "0" else "设置落地代理"
+            await wait_msg.edit_text(
+                f"✅ <b>端口 {port} {action}成功！</b>\nXray 核心已重启生效。",
+                reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]),
+                parse_mode="HTML"
+            )
+        except Exception as exc:
+            await wait_msg.edit_text(f"❌ 路由修改失败：`{exc}`", reply_markup=inline_kb([[("🔙 返回列表", f"p:list:{instance_id}:{page}")]]))
+# ================= 流量重置 =================
 @router.callback_query(F.data.startswith("pn:rst:"))
 async def cb_reset_node(call: CallbackQuery, state: FSMContext):
-    # 🌟 修复：把 answer 放在最前面，确保无论怎样点击都有反馈，不会假死
+    # 确保 TG 机器人第一时间响应点击
     await call.answer("🔄 正在向面板发送重置指令…")
     
     parts = call.data.split(":")
     instance_id = parts[2]
-    # 兼容处理以防数据残缺导致后续报错
-    inbound_id = parts[3] if len(parts) > 3 else "0"
-    page = int(parts[4]) if len(parts) > 4 else 0
+    inbound_id = parts[3]
+    page = int(parts[4])
 
     try:
         client = await ensure_client(instance_id)
-        success = False
         
-        # 1. 尝试 3x-ui 各种版本的重置 API
-        endpoints = [
-            f"/panel/api/inbounds/resetAllClientTraffics/{inbound_id}",
-            f"/panel/api/inbounds/resetClientTraffics/{inbound_id}",
-            f"/panel/api/inbounds/{inbound_id}/resetClientTraffics"
-        ]
-        
-        for ep in endpoints:
-            try:
-                await client.request_json("POST", ep)
-                success = True
-                break
-            except Exception:
-                continue
-                
-        # 2. 如果全都报 404，使用“硬重置”兜底：直接拉取配置清零再上传
-        if not success:
-            resp = await client.request_json("GET", f"/panel/api/inbounds/get/{inbound_id}")
-            inbound_data = resp.get("obj", {})
-            if not inbound_data:
-                raise Exception("面板未能返回节点详细数据，可能节点已不存在")
-                
-            inbound_data["up"] = 0
-            inbound_data["down"] = 0
-            
-            # 清理客户端内部的流量
-            settings = inbound_data.get("settings")
-            if isinstance(settings, str):
-                try:
-                    import json
-                    settings_dict = json.loads(settings)
-                    for c in settings_dict.get("clients", []):
-                        c["up"] = 0
-                        c["down"] = 0
-                    inbound_data["settings"] = json.dumps(settings_dict)
-                except Exception:
-                    pass
-            elif isinstance(settings, dict):
-                for c in settings.get("clients", []):
-                    c["up"] = 0
-                    c["down"] = 0
-                inbound_data["settings"] = settings
-                
-            # 原样覆盖更新回面板
-            await client.request_json("POST", f"/panel/api/inbounds/update/{inbound_id}", json=inbound_data)
+        # 🌟 核心修复：严格按照 3x-ui 3.x 官方文档的接口路径调用
+        api_path = f"/panel/api/inbounds/{inbound_id}/resetTraffic"
+        await client.request_json("POST", api_path)
             
         await call.answer(f"✅ 节点 #{inbound_id} 流量已成功清零！", show_alert=True)
         await render_node_list(call, instance_id, page)
