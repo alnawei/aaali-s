@@ -91,24 +91,32 @@ def _format_error(exc: Exception) -> str:
 
 
 def _is_retryable_reinstall_error(error_text: str) -> bool:
+    """
+    只对明确表示实例仍处于状态切换/系统重置中的错误重试。
+    不匹配 RequestId：几乎所有阿里云错误都可能带 RequestId，
+    将它作为条件会把权限、密码格式、参数等永久错误也重试 15 分钟。
+    """
     text = (error_text or "").lower()
-    keywords = [
+    retryable_markers = (
         "incorrectinstancestatus",
         "incorrect instance status",
         "invalidinstance.status",
         "operationconflict",
+        "invalidoperation.conflict",
+        "ecs task is conflicted",
+        "task is conflicted",
         "operation conflict",
         "instance is busy",
         "being reset",
         "resetting",
         "task is running",
-        "requestid",
         "servicebusy",
         "system operation",
         "正在重置",
         "操作进行中",
-    ]
-    return any(k in text for k in keywords)
+        "实例正在处理其他任务",
+    )
+    return any(marker in text for marker in retryable_markers)
 
 
 # =========================================================
@@ -197,6 +205,48 @@ async def wait_swas_status(
         await asyncio.sleep(POWER_POLL_INTERVAL)
 
 
+async def wait_swas_reboot_complete(
+    account_id: int,
+    region_id: str,
+    instance_id: str,
+    timeout: int = POWER_TIMEOUT,
+):
+    """
+    等待重启后的稳定 Running。
+    SWAS 的 Starting 状态可能很短，轮询可能错过；
+    因此不强制要求捕获 Starting，而是在重启请求成功后留出状态更新时间，
+    再要求连续多次查询均为 Running，避免旧状态导致提前成功。
+    """
+    started = time.monotonic()
+    last_status = None
+    consecutive_running = 0
+    minimum_wait = 15
+    required_running_checks = 3
+
+    while time.monotonic() - started < timeout:
+        status = await asyncio.to_thread(
+            _get_swas_status_sync,
+            account_id,
+            region_id,
+            instance_id,
+        )
+        last_status = status
+        elapsed = time.monotonic() - started
+
+        if status == "Running" and elapsed >= minimum_wait:
+            consecutive_running += 1
+            if consecutive_running >= required_running_checks:
+                return status
+        else:
+            consecutive_running = 0
+
+        await asyncio.sleep(POWER_POLL_INTERVAL)
+
+    raise TimeoutError(
+        f"等待重启后实例稳定运行超时，最后状态: {last_status}；"
+        f"连续 Running 检查次数: {consecutive_running}/{required_running_checks}"
+    )
+
 # =========================================================
 # 获取实例完整信息
 # =========================================================
@@ -267,6 +317,8 @@ def _execute_swas_action_sync(
     action: str,
     password: str | None = None,
     image_id: str | None = None,
+    account_id: int | None = None,
+    region_id: str | None = None,
 ) -> dict:
     """
     真实调用阿里云 API。
@@ -277,17 +329,22 @@ def _execute_swas_action_sync(
     - 修改密码使用 UpdateInstanceAttribute。
     - 密码修改后必须 RebootInstance 才能生效。
     """
-    meta = get_single_swas_sync(instance_id)
-    if not meta:
-        return {
-            "success": False,
-            "error": "未在阿里云匹配到该实例信息",
-        }
-
-    region_id = meta["region"]
+    # 已知账号和地域时直接使用，避免重装每一步都扫描全部账号/地域。
+    # 其他旧调用方不传这两个参数时，继续兼容原有自动定位逻辑。
+    if account_id is not None and region_id:
+        meta = {"account_id": account_id, "region": region_id}
+    else:
+        meta = get_single_swas_sync(instance_id)
+        if not meta:
+            return {
+                "success": False,
+                "error": "未在阿里云匹配到该实例信息",
+            }
+        account_id = meta["account_id"]
+        region_id = meta["region"]
 
     try:
-        client = get_swas_client(meta["account_id"], region_id)
+        client = get_swas_client(account_id, region_id)
         client_token = str(uuid.uuid4())
 
         if action == "stop":
@@ -347,7 +404,7 @@ def _execute_swas_action_sync(
 
         return {
             "success": True,
-            "account_id": meta["account_id"],
+            "account_id": account_id,
             "region": region_id,
             "response": resp,
         }
@@ -356,7 +413,7 @@ def _execute_swas_action_sync(
         return {
             "success": False,
             "error": _format_error(exc),
-            "account_id": meta["account_id"],
+            "account_id": account_id,
             "region": region_id,
         }
 
@@ -606,6 +663,8 @@ async def execute_with_retry(
     action: str,
     password: str | None = None,
     timeout: int = REINSTALL_TIMEOUT,
+    account_id: int | None = None,
+    region_id: str | None = None,
 ):
     """
     用于 ResetSystem 后的过渡阶段。
@@ -620,6 +679,9 @@ async def execute_with_retry(
             instance_id,
             action,
             password,
+            None,
+            account_id,
+            region_id,
         )
 
         if result["success"]:
@@ -1402,6 +1464,10 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
                 _execute_swas_action_sync,
                 instance_id,
                 "stop",
+                None,
+                None,
+                account_id,
+                region_id,
             )
             if not result["success"]:
                 raise RuntimeError(result["error"])
@@ -1428,6 +1494,10 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
             _execute_swas_action_sync,
             instance_id,
             "reinstall",
+            None,
+            None,
+            account_id,
+            region_id,
         )
         if not reset_result["success"]:
             raise RuntimeError(reset_result["error"])
@@ -1449,6 +1519,8 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
             action="resetpw",
             password=DEFAULT_PASSWORD,
             timeout=REINSTALL_TIMEOUT,
+            account_id=account_id,
+            region_id=region_id,
         )
 
         if not password_result["success"]:
@@ -1470,6 +1542,8 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
             instance_id=instance_id,
             action="reboot",
             timeout=POWER_TIMEOUT,
+            account_id=account_id,
+            region_id=region_id,
         )
 
         if not reboot_result["success"]:
@@ -1478,6 +1552,10 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
                 _execute_swas_action_sync,
                 instance_id,
                 "start",
+                None,
+                None,
+                account_id,
+                region_id,
             )
             if not start_result["success"]:
                 raise RuntimeError(
@@ -1493,11 +1571,10 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
             parse_mode="Markdown",
         )
 
-        await wait_swas_status(
+        await wait_swas_reboot_complete(
             account_id,
             region_id,
             instance_id,
-            "Running",
             POWER_TIMEOUT,
         )
 
