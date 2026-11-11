@@ -212,12 +212,16 @@ async def wait_swas_reboot_complete(
     timeout: int = POWER_TIMEOUT,
 ):
     """
-    等待 RebootInstance 的完整状态转换：Running -> Starting -> Running。
-    不能只检查 Running，否则重启请求刚提交时，旧的 Running 状态会导致提前返回。
+    等待重启后的稳定 Running。
+    SWAS 的 Starting 状态可能很短，轮询可能错过；
+    因此不强制要求捕获 Starting，而是在重启请求成功后留出状态更新时间，
+    再要求连续多次查询均为 Running，避免旧状态导致提前成功。
     """
     started = time.monotonic()
-    saw_starting = False
     last_status = None
+    consecutive_running = 0
+    minimum_wait = 15
+    required_running_checks = 3
 
     while time.monotonic() - started < timeout:
         status = await asyncio.to_thread(
@@ -227,24 +231,21 @@ async def wait_swas_reboot_complete(
             instance_id,
         )
         last_status = status
+        elapsed = time.monotonic() - started
 
-        if status == "Starting":
-            saw_starting = True
-        elif status == "Running" and saw_starting:
-            return status
+        if status == "Running" and elapsed >= minimum_wait:
+            consecutive_running += 1
+            if consecutive_running >= required_running_checks:
+                return status
+        else:
+            consecutive_running = 0
 
         await asyncio.sleep(POWER_POLL_INTERVAL)
 
-    if not saw_starting:
-        raise TimeoutError(
-            f"未观察到重启状态 Starting，最后状态: {last_status}；"
-            "不能确认密码修改已通过重启生效"
-        )
-
     raise TimeoutError(
-        f"已观察到 Starting，但等待重启后 Running 超时，最后状态: {last_status}"
+        f"等待重启后实例稳定运行超时，最后状态: {last_status}；"
+        f"连续 Running 检查次数: {consecutive_running}/{required_running_checks}"
     )
-
 
 # =========================================================
 # 获取实例完整信息
