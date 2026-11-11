@@ -205,6 +205,47 @@ async def wait_swas_status(
         await asyncio.sleep(POWER_POLL_INTERVAL)
 
 
+async def wait_swas_reboot_complete(
+    account_id: int,
+    region_id: str,
+    instance_id: str,
+    timeout: int = POWER_TIMEOUT,
+):
+    """
+    等待 RebootInstance 的完整状态转换：Running -> Starting -> Running。
+    不能只检查 Running，否则重启请求刚提交时，旧的 Running 状态会导致提前返回。
+    """
+    started = time.monotonic()
+    saw_starting = False
+    last_status = None
+
+    while time.monotonic() - started < timeout:
+        status = await asyncio.to_thread(
+            _get_swas_status_sync,
+            account_id,
+            region_id,
+            instance_id,
+        )
+        last_status = status
+
+        if status == "Starting":
+            saw_starting = True
+        elif status == "Running" and saw_starting:
+            return status
+
+        await asyncio.sleep(POWER_POLL_INTERVAL)
+
+    if not saw_starting:
+        raise TimeoutError(
+            f"未观察到重启状态 Starting，最后状态: {last_status}；"
+            "不能确认密码修改已通过重启生效"
+        )
+
+    raise TimeoutError(
+        f"已观察到 Starting，但等待重启后 Running 超时，最后状态: {last_status}"
+    )
+
+
 # =========================================================
 # 获取实例完整信息
 # =========================================================
@@ -1529,11 +1570,10 @@ async def process_swas_reinstall_execute(callback: types.CallbackQuery):
             parse_mode="Markdown",
         )
 
-        await wait_swas_status(
+        await wait_swas_reboot_complete(
             account_id,
             region_id,
             instance_id,
-            "Running",
             POWER_TIMEOUT,
         )
 
